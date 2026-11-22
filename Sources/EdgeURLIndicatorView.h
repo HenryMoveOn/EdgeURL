@@ -27,5 +27,11 @@ typedef NS_ENUM(NSInteger, EdgeURLEdge) {
 @property (nonatomic, assign) BOOL showArea;
 /// NO draws the old triangle instead of the wave (the Animated setting).
 @property (nonatomic, assign) BOOL animatedStyle;
+/// YES draws only the trigger bands, on the enabled edges, and no wave: the
+/// preview shown when a setting changes, so the opacity and the region can be
+/// seen without a swipe.
+@property (nonatomic, assign) BOOL previewMode;
+@property (nonatomic, assign) BOOL leftEdgeEnabled;
+@property (nonatomic, assign) BOOL rightEdgeEnabled;
 
 @end

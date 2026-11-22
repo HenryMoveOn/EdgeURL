@@ -51,4 +51,14 @@ __attribute__((constructor)) static void TweakInitialize(void) {
                     @selector(applicationDidFinishLaunching:),
                     (IMP)HookedDidFinishLaunching,
                     (IMP *)&OriginalDidFinishLaunching);
+
+    // The hook is not the only way in: in this springboard's launch the
+    // delegate method is reached without passing through it, and then nothing
+    // ever started. So the controller is started from here as well, once the
+    // application has had time to bring its scene up. -start is idempotent.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        os_log(TweakLog(), "ApelinTimerStart %{public}s", APELIN_BUILD_ID);
+        [[EdgeURLGestureController sharedController] start];
+    });
 }

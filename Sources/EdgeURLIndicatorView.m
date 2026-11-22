@@ -14,6 +14,12 @@ static CGFloat EdgeURLClamped(CGFloat value, CGFloat low, CGFloat high) {
     return value;
 }
 
+// The blue every part of the indicator is drawn in: the trigger area, the
+// glow, the capsule and the chevron.
+static UIColor *EdgeURLTint(CGFloat alpha) {
+    return [[UIColor systemBlueColor] colorWithAlphaComponent:alpha];
+}
+
 // A band `width` wide flush against the named edge.
 static CGRect EdgeURLEdgeRect(CGFloat screenWidth, BOOL left, CGFloat width, CGFloat y, CGFloat height) {
     CGFloat minX = left ? 0.0 : screenWidth - width;
@@ -75,26 +81,48 @@ static CGRect EdgeURLEdgeRect(CGFloat screenWidth, BOOL left, CGFloat width, CGF
     CGFloat progress = EdgeURLClamped(self.progress, 0.0, 1.0);
 
     if (self.showArea && self.areaAlpha > 0.001) {
-        CGFloat top = height * EdgeURLClamped(self.regionTop, 0.0, 100.0) / 100.0;
-        CGFloat areaHeight = height * EdgeURLClamped(self.regionHeight, 0.0, 100.0) / 100.0;
-        areaHeight = MIN(areaHeight, height - top);
-        if (areaHeight > 1.0) {
-            CGRect areaRect = EdgeURLEdgeRect(width, left, band, top, areaHeight);
-            UIBezierPath *area = [UIBezierPath bezierPathWithRoundedRect:areaRect
-                                                               cornerRadius:MIN(12.0, band * 0.5)];
-            // One fill, at exactly the opacity the slider holds: the band used
-            // to be a half-strength fill with a full-strength outline painted
-            // on top of it, so the setting never matched what was drawn.
-            [[UIColor colorWithWhite:1.0 alpha:EdgeURLClamped(self.areaAlpha, 0.0, 1.0)] setFill];
-            [area fill];
+        if (self.previewMode) {
+            // The preview shows where the trigger is, on every enabled edge,
+            // and nothing else.
+            if (self.leftEdgeEnabled) {
+                [self drawTriggerAreaLeft:YES width:width height:height band:band];
+            }
+            if (self.rightEdgeEnabled) {
+                [self drawTriggerAreaLeft:NO width:width height:height band:band];
+            }
+            return;
         }
+        [self drawTriggerAreaLeft:left width:width height:height band:band];
     }
 
+    if (self.previewMode) {
+        return;
+    }
     if (self.animatedStyle) {
         [self drawWaveWithWidth:width height:height left:left band:band progress:progress];
     } else {
         [self drawLegacyTriangleWithWidth:width height:height left:left band:band];
     }
+}
+
+// One fill, at exactly the opacity the slider holds: the band used to be a
+// half-strength fill with a full-strength outline painted on top of it, so the
+// setting never matched what was drawn.
+- (void)drawTriggerAreaLeft:(BOOL)left
+                      width:(CGFloat)width
+                     height:(CGFloat)height
+                       band:(CGFloat)band {
+    CGFloat top = height * EdgeURLClamped(self.regionTop, 0.0, 100.0) / 100.0;
+    CGFloat areaHeight = height * EdgeURLClamped(self.regionHeight, 0.0, 100.0) / 100.0;
+    areaHeight = MIN(areaHeight, height - top);
+    if (areaHeight <= 1.0) {
+        return;
+    }
+    CGRect areaRect = EdgeURLEdgeRect(width, left, band, top, areaHeight);
+    UIBezierPath *area = [UIBezierPath bezierPathWithRoundedRect:areaRect
+                                                       cornerRadius:MIN(12.0, band * 0.5)];
+    [EdgeURLTint(EdgeURLClamped(self.areaAlpha, 0.0, 1.0)) setFill];
+    [area fill];
 }
 
 // The wave: a translucent capsule that grows inward and brightens with
@@ -113,13 +141,13 @@ static CGRect EdgeURLEdgeRect(CGFloat screenWidth, BOOL left, CGFloat width, CGF
     CGRect glowRect = EdgeURLEdgeRect(width, left, innerWidth + 16.0, top - 5.0, capsuleHeight + 10.0);
     UIBezierPath *glow = [UIBezierPath bezierPathWithRoundedRect:glowRect
                                                         cornerRadius:(capsuleHeight + 10.0) * 0.5];
-    [[UIColor colorWithWhite:1.0 alpha:0.05 + 0.12 * progress] setFill];
+    [EdgeURLTint(0.05 + 0.12 * progress) setFill];
     [glow fill];
 
     CGRect capsuleRect = EdgeURLEdgeRect(width, left, innerWidth, top, capsuleHeight);
     UIBezierPath *capsule = [UIBezierPath bezierPathWithRoundedRect:capsuleRect
                                                            cornerRadius:innerWidth * 0.5];
-    [[UIColor colorWithWhite:1.0 alpha:0.16 + 0.34 * progress] setFill];
+    [EdgeURLTint(0.16 + 0.34 * progress) setFill];
     [capsule fill];
 
     CGFloat size = 4.5 + 3.5 * progress;
@@ -149,9 +177,9 @@ static CGRect EdgeURLEdgeRect(CGFloat screenWidth, BOOL left, CGFloat width, CGF
     [triangle addLineToPoint:CGPointMake(left ? 0.0 : width, centerY - half)];
     [triangle addLineToPoint:CGPointMake(left ? 0.0 : width, centerY + half)];
     [triangle closePath];
-    [[UIColor colorWithWhite:1.0 alpha:0.3] setFill];
+    [EdgeURLTint(0.3) setFill];
     [triangle fill];
-    [[UIColor colorWithWhite:1.0 alpha:0.7] setStroke];
+    [EdgeURLTint(0.7) setStroke];
     triangle.lineWidth = 1.5;
     triangle.lineJoinStyle = kCGLineJoinRound;
     [triangle stroke];

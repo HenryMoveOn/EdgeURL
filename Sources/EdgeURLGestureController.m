@@ -87,6 +87,7 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
 
 @property (nonatomic, assign) NSUInteger registeredGestureType;
 @property (nonatomic, assign) BOOL started;
+@property (nonatomic, assign) NSUInteger attachAttempts;
 
 @property (nonatomic, assign) EdgeURLEdge pendingEdge;
 @property (nonatomic, assign) EdgeURLEdge activeEdge;
@@ -158,11 +159,33 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
     [self attachToConnectedScenes];
 
     // The scene may connect a moment after we load; the notification above
-    // covers that, and this covers a scene that was already there.
+    // covers that, and the retry below covers a scene that was already there
+    // and a manager that refuses the recognizer early in the launch.
+    [self scheduleAttachAttempt];
+}
+
+// Keeps asking for a scene until one takes the recognizer, for the first couple
+// of minutes of the process's life: on this springboard the scene arrives well
+// after the launch callbacks, and one attempt at load time was not enough.
+- (void)scheduleAttachAttempt {
+    if (self.attachedScenes.count > 0) {
+        return;
+    }
+    if (self.attachAttempts >= 40) {
+        os_log(EdgeURLGestureLog(), "giving up: no scene took the recognizer after %lu attempts",
+               (unsigned long)self.attachAttempts);
+        return;
+    }
+    self.attachAttempts += 1;
+    [self attachToConnectedScenes];
+    if (self.attachedScenes.count > 0) {
+        os_log(EdgeURLGestureLog(), "attached after %lu attempt(s)", (unsigned long)self.attachAttempts);
+        return;
+    }
     __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        [weakSelf attachToConnectedScenes];
+        [weakSelf scheduleAttachAttempt];
     });
 }
 
@@ -204,6 +227,7 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
     BOOL typeChanged = (settings.gestureType != self.registeredGestureType);
     self.settings = settings;
     os_log(EdgeURLGestureLog(), "preferences reloaded %{public}s", settings.summary.UTF8String);
+    EdgeURLDebugLog(@"prefs changed %@", settings.summary);
     if (!settings.enabled && self.active) {
         [self finishWithProgress:self.indicatorView.progress opens:NO];
     }
@@ -211,6 +235,13 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
         self.registeredGestureType = settings.gestureType;
         [self reattach];
     }
+    if (self.attachedScenes.count == 0) {
+        [self attachToConnectedScenes];
+    }
+    // The trigger area stays on screen: its edges, region, width and opacity
+    // are read straight from the settings, so every move of a slider shows at
+    // once and a wrong region or a faint band is visible without a swipe.
+    [self updateTriggerAreas];
 }
 
 #pragma mark - Scene attachment
@@ -254,37 +285,52 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
     return manager;
 }
 
-- (void)attachToConnectedScenes {
-    NSSet<UIScene *> *scenes = [UIApplication sharedApplication].connectedScenes;
-    EdgeURLDebugLog(@"connectedScenes count=%lu", (unsigned long)scenes.count);
-    for (UIScene *scene in scenes) {
-        BOOL windowScene = [scene isKindOfClass:[UIWindowScene class]];
-        EdgeURLDebugLog(@"scene %@ windowScene=%d activation=%ld respondsSelector=%d respondsManager=%d",
-                        NSStringFromClass([scene class]), windowScene,
-                        (long)scene.activationState,
-                        [scene respondsToSelector:@selector(systemGestureManager)],
-                        [scene respondsToSelector:@selector(systemGestureManager)] &&
-                            [[(UIWindowScene *)scene systemGestureManager]
-                                respondsToSelector:@selector(addGestureRecognizer:withType:)]);
-        if (!windowScene) {
+// The scenes that own a system gesture manager and could take the recognizer,
+// the main display scene first.
+- (NSArray<UIWindowScene *> *)eligibleScenes {
+    NSMutableArray<UIWindowScene *> *preferred = [NSMutableArray array];
+    NSMutableArray<UIWindowScene *> *rest = [NSMutableArray array];
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) {
             continue;
         }
-        [self attachToScene:(UIWindowScene *)scene];
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        if (windowScene.activationState == UISceneActivationStateUnattached) {
+            continue;
+        }
+        if ([self gestureManagerForScene:windowScene] == nil) {
+            EdgeURLDebugLog(@"no manager for %@", NSStringFromClass([scene class]));
+            continue;
+        }
+        if (EdgeURLSceneNameIsMainDisplay(NSStringFromClass([scene class]))) {
+            [preferred addObject:windowScene];
+        } else {
+            [rest addObject:windowScene];
+        }
     }
+    return [preferred arrayByAddingObjectsFromArray:rest];
 }
 
-- (void)attachToScene:(UIWindowScene *)scene {
-    if (scene == nil || [self.attachedScenes containsObject:scene]) {
+// One manager is enough, and more than one is not allowed: the same recognizer
+// handed to a second manager is refused, and the manager raises an exception
+// rather than answering NO, which would end SpringBoard. So the first scene
+// that takes it wins, and the managers report every touch on the display.
+- (void)attachToConnectedScenes {
+    NSArray<UIWindowScene *> *scenes = [self eligibleScenes];
+    os_log(EdgeURLGestureLog(), "attach attempt %lu: %lu eligible scene(s)",
+           (unsigned long)self.attachAttempts, (unsigned long)scenes.count);
+    if (self.attachedScenes.count > 0) {
         return;
     }
-    UISystemGestureManager *manager = [self gestureManagerForScene:scene];
-    if (manager == nil) {
-        os_log(EdgeURLGestureLog(), "skipped scene %{public}@: not a main display scene with a system gesture manager",
-               NSStringFromClass([scene class]));
-        EdgeURLDebugLog(@"skip %@", NSStringFromClass([scene class]));
-        return;
+    for (UIWindowScene *scene in scenes) {
+        if ([self attachToScene:scene]) {
+            break;
+        }
     }
-    EdgeURLSettings *settings = [self currentSettings];
+    [self updateTriggerAreas];
+}
+
+- (UIPanGestureRecognizer *)makeRecognizerIfNeeded {
     if (self.recognizer == nil) {
         UIPanGestureRecognizer *recognizer =
             [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
@@ -294,16 +340,39 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
         recognizer.delaysTouchesEnded = NO;
         self.recognizer = recognizer;
     }
-    [manager addGestureRecognizer:self.recognizer withType:settings.gestureType];
+    return self.recognizer;
+}
+
+- (BOOL)attachToScene:(UIWindowScene *)scene {
+    if (scene == nil || [self.attachedScenes containsObject:scene]) {
+        return NO;
+    }
+    UISystemGestureManager *manager = [self gestureManagerForScene:scene];
+    if (manager == nil) {
+        return NO;
+    }
+    UIPanGestureRecognizer *recognizer = [self makeRecognizerIfNeeded];
+    NSUInteger type = [self currentSettings].gestureType;
+    @try {
+        [manager addGestureRecognizer:recognizer withType:type];
+    } @catch (NSException *exception) {
+        // The refusal carries the one thing worth knowing about the slot: the
+        // manager's own reason.
+        os_log(EdgeURLGestureLog(), "refused %{public}@ type=%lu: %{public}@",
+               NSStringFromClass([scene class]), (unsigned long)type, exception.reason);
+        EdgeURLDebugLog(@"refused %@ type=%lu: %@", NSStringFromClass([scene class]),
+                        (unsigned long)type, exception.reason);
+        return NO;
+    }
     [self.attachedScenes addObject:scene];
-    EdgeURLDebugLog(@"attached %@ type=%lu display=%@ recognizer=%@",
-                    NSStringFromClass([scene class]), (unsigned long)settings.gestureType,
-                    NSStringFromCGRect([UIScreen mainScreen].coordinateSpace.bounds), self.recognizer);
+    EdgeURLDebugLog(@"attached %@ type=%lu display=%@",
+                    NSStringFromClass([scene class]), (unsigned long)type,
+                    NSStringFromCGRect([UIScreen mainScreen].coordinateSpace.bounds));
     os_log(EdgeURLGestureLog(),
            "attached scene %{public}@ type=%lu display=%{public}@",
-           NSStringFromClass([scene class]),
-           (unsigned long)settings.gestureType,
+           NSStringFromClass([scene class]), (unsigned long)type,
            NSStringFromCGRect([UIScreen mainScreen].coordinateSpace.bounds));
+    return YES;
 }
 
 - (void)reattach {
@@ -621,15 +690,34 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
 }
 
 - (void)showOverlayWithSettings:(EdgeURLSettings *)settings {
+    if (![self prepareOverlayWithSettings:settings]) {
+        return;
+    }
+    EdgeURLIndicatorView *view = self.indicatorView;
+    view.previewMode = NO;
+    view.edge = self.activeEdge;
+    view.progress = 0.0;
+    view.alpha = 1.0;
+    self.overlayWindow.hidden = NO;
+    [view setNeedsDisplay];
+    os_log(EdgeURLAnimationLog(), "overlay shown display=%{public}@ edge=%{public}s style=%{public}s",
+           NSStringFromCGRect([self displayBounds]), EdgeURLGestureName(self.activeEdge).UTF8String,
+           settings.animated ? "wave" : "triangle");
+}
+
+// The overlay window, and the view holding the settings' geometry. Answers NO
+// when there is nowhere to draw: no scene, or a display of no size.
+- (BOOL)prepareOverlayWithSettings:(EdgeURLSettings *)settings {
     CGRect display = [self displayBounds];
     if (CGRectGetWidth(display) < 2.0 || CGRectGetHeight(display) < 2.0) {
-        return;
+        EdgeURLDebugLog(@"no display for the overlay: %@", NSStringFromCGRect(display));
+        return NO;
     }
     if (self.overlayWindow == nil) {
         UIWindowScene *scene = [self activeScene];
         if (scene == nil) {
             os_log(EdgeURLAnimationLog(), "no scene for the overlay");
-            return;
+            return NO;
         }
         UIWindow *window = [[UIWindow alloc] initWithWindowScene:scene];
         window.backgroundColor = [UIColor clearColor];
@@ -639,27 +727,67 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
         UIViewController *host = [[UIViewController alloc] init];
         host.view = self.indicatorView;
         window.rootViewController = host;
+        window.hidden = YES;
         self.overlayWindow = window;
     }
     self.overlayWindow.frame = display;
-    self.indicatorView.alpha = 1.0;
 
     EdgeURLIndicatorView *view = self.indicatorView;
     view.frame = self.overlayWindow.bounds;
-    view.edge = self.activeEdge;
     view.bandWidth = settings.edgeWidth;
     view.regionTop = settings.regionTop;
     view.regionHeight = settings.regionHeight;
     view.areaAlpha = settings.areaAlpha;
     view.showArea = settings.showArea;
     view.animatedStyle = settings.animated;
+    view.leftEdgeEnabled = settings.leftEdge;
+    view.rightEdgeEnabled = settings.rightEdge;
+    return YES;
+}
+
+// The trigger area, drawn on every enabled edge and left there: no timer, no
+// fade. It is the same band a swipe shows, so the setting and the gesture
+// cannot disagree about where the edge is.
+- (void)updateTriggerAreas {
+    EdgeURLSettings *settings = [self currentSettings];
+    BOOL wanted = settings.enabled && settings.showArea && settings.areaAlpha > 0.001 &&
+                  (settings.leftEdge || settings.rightEdge);
+    if (!wanted) {
+        [self hideTriggerAreas];
+        return;
+    }
+    if (![self prepareOverlayWithSettings:settings]) {
+        return;
+    }
+    if (self.active) {
+        return;  // A swipe is drawing its own wave over the band.
+    }
+    [self stopFade];
+    EdgeURLIndicatorView *view = self.indicatorView;
+    view.previewMode = YES;
+    view.edge = settings.leftEdge ? EdgeURLEdgeLeft : EdgeURLEdgeRight;
     view.progress = 0.0;
+    view.alpha = 1.0;
+    self.overlayWindow.hidden = NO;
     [view setNeedsDisplay];
 
-    self.overlayWindow.hidden = NO;
-    os_log(EdgeURLAnimationLog(), "overlay shown display=%{public}@ edge=%{public}s style=%{public}s",
-           NSStringFromCGRect(display), EdgeURLGestureName(self.activeEdge).UTF8String,
-           settings.animated ? "wave" : "triangle");
+    os_log(EdgeURLAnimationLog(), "trigger areas shown left=%d right=%d alpha=%.2f width=%.1f top=%.1f height=%.1f",
+           settings.leftEdge, settings.rightEdge, settings.areaAlpha,
+           settings.edgeWidth, settings.regionTop, settings.regionHeight);
+    EdgeURLDebugLog(@"band shown left=%d right=%d alpha=%.2f window=%@ hidden=%d alpha=%.2f view=%@",
+                    settings.leftEdge, settings.rightEdge, settings.areaAlpha,
+                    self.overlayWindow, self.overlayWindow.hidden, view.alpha, view);
+}
+
+- (void)hideTriggerAreas {
+    if (self.overlayWindow.hidden) {
+        return;
+    }
+    [self stopFade];
+    self.indicatorView.previewMode = NO;
+    self.indicatorView.alpha = 1.0;
+    self.overlayWindow.hidden = YES;
+    os_log(EdgeURLAnimationLog(), "trigger areas hidden");
 }
 
 - (void)fadeOutFromProgress:(CGFloat)progress {
@@ -688,6 +816,8 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
         self.indicatorView.alpha = 1.0;
         self.indicatorView.progress = 0.0;
         self.overlayWindow.hidden = YES;
+        // The wave is done; the trigger area it covered comes back.
+        [self updateTriggerAreas];
     }
 }
 
