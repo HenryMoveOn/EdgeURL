@@ -82,11 +82,11 @@ static CGRect EdgeURLEdgeRect(CGFloat screenWidth, BOOL left, CGFloat width, CGF
             CGRect areaRect = EdgeURLEdgeRect(width, left, band, top, areaHeight);
             UIBezierPath *area = [UIBezierPath bezierPathWithRoundedRect:areaRect
                                                                cornerRadius:MIN(12.0, band * 0.5)];
-            [[UIColor colorWithWhite:1.0 alpha:self.areaAlpha * 0.5] setFill];
+            // One fill, at exactly the opacity the slider holds: the band used
+            // to be a half-strength fill with a full-strength outline painted
+            // on top of it, so the setting never matched what was drawn.
+            [[UIColor colorWithWhite:1.0 alpha:EdgeURLClamped(self.areaAlpha, 0.0, 1.0)] setFill];
             [area fill];
-            [[UIColor colorWithWhite:1.0 alpha:self.areaAlpha] setStroke];
-            area.lineWidth = 1.0;
-            [area stroke];
         }
     }
 

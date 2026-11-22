@@ -82,7 +82,6 @@
       ],
       "resources": [
         "Resources/Root.plist",
-        "Resources/Area.plist",
         "Resources/icon.png",
         "Resources/icon@2x.png",
         "Resources/icon@3x.png"

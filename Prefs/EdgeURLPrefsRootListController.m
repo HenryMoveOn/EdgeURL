@@ -10,9 +10,6 @@
 @interface EdgeURLPrefsRootListController : PSListController
 @end
 
-@interface EdgeURLPrefsAreaListController : PSListController
-@end
-
 static NSString *EdgeURLPrefsDomain(void) {
     return @APELIN_PACKAGE_ID;
 }
@@ -78,17 +75,6 @@ static void EdgeURLPrefsPostChanged(void) {
     CFPreferencesAppSynchronize(domain);
     EdgeURLPrefsPostChanged();
     [self reloadSpecifiers];
-}
-
-@end
-
-@implementation EdgeURLPrefsAreaListController
-
-- (NSArray *)specifiers {
-    if (_specifiers == nil) {
-        _specifiers = [self loadSpecifiersFromPlistName:@"Area" target:self];
-    }
-    return _specifiers;
 }
 
 @end

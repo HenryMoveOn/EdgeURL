@@ -15,8 +15,27 @@
 #import <QuartzCore/QuartzCore.h>
 #import <notify.h>
 #import <os/log.h>
+#import <fcntl.h>
+#import <stdarg.h>
+#import <unistd.h>
 
 static const CFTimeInterval EdgeURLFadeDuration = 0.12;
+
+// TEMPORARY diagnostic: os_log only answers live listeners, so the same lines
+// also go to a file that survives the gesture.
+static void EdgeURLDebugLog(NSString *format, ...) {
+    va_list args;
+    va_start(args, format);
+    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+    NSString *line = [NSString stringWithFormat:@"%.2f %@\n", CACurrentMediaTime(), message];
+    const char *bytes = line.UTF8String;
+    int fd = open("/var/mobile/Library/Caches/EdgeURL-debug.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (fd >= 0) {
+        write(fd, bytes, strlen(bytes));
+        close(fd);
+    }
+}
 
 static CGFloat EdgeURLFraction(CGFloat value) {
     return MIN(1.0, MAX(0.0, value));
@@ -134,6 +153,7 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
 
     EdgeURLSettings *settings = [self currentSettings];
     os_log(EdgeURLGestureLog(), "started %{public}s", settings.summary.UTF8String);
+    EdgeURLDebugLog(@"started %@", settings.summary);
 
     [self attachToConnectedScenes];
 
@@ -195,9 +215,58 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
 
 #pragma mark - Scene attachment
 
+// SpringBoard keeps more window scenes than its own: the System Aperture one
+// (the Dynamic Island), banner and service scenes. They are UIWindowScenes, yet
+// some do not answer -systemGestureManager at all, and a message sent there
+// raises an unrecognized selector that ends the process. So every scene is
+// judged first and only the main display scene, which owns the screen's
+// gesture manager, may take the recognizer. Nothing is sent to a scene that
+// has not answered respondsToSelector: for the exact selector.
+static BOOL EdgeURLSceneNameIsAuxiliary(NSString *className) {
+    return [className containsString:@"Aperture"] ||
+           [className containsString:@"Banner"] ||
+           [className containsString:@"Service"] ||
+           [className containsString:@"StatusBar"];
+}
+
+static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
+    return [className containsString:@"MainDisplayWindowScene"] ||
+           [className containsString:@"SBWindowScene"];
+}
+
+// The manager of a scene that may have one, or nil. Every check comes before
+// the message it guards.
+- (UISystemGestureManager *)gestureManagerForScene:(UIWindowScene *)scene {
+    if (scene == nil || ![scene isKindOfClass:[UIWindowScene class]]) {
+        return nil;
+    }
+    NSString *className = NSStringFromClass([scene class]);
+    if (EdgeURLSceneNameIsAuxiliary(className)) {
+        return nil;
+    }
+    if (![scene respondsToSelector:@selector(systemGestureManager)]) {
+        return nil;
+    }
+    UISystemGestureManager *manager = [scene systemGestureManager];
+    if (manager == nil || ![manager respondsToSelector:@selector(addGestureRecognizer:withType:)]) {
+        return nil;
+    }
+    return manager;
+}
+
 - (void)attachToConnectedScenes {
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) {
+    NSSet<UIScene *> *scenes = [UIApplication sharedApplication].connectedScenes;
+    EdgeURLDebugLog(@"connectedScenes count=%lu", (unsigned long)scenes.count);
+    for (UIScene *scene in scenes) {
+        BOOL windowScene = [scene isKindOfClass:[UIWindowScene class]];
+        EdgeURLDebugLog(@"scene %@ windowScene=%d activation=%ld respondsSelector=%d respondsManager=%d",
+                        NSStringFromClass([scene class]), windowScene,
+                        (long)scene.activationState,
+                        [scene respondsToSelector:@selector(systemGestureManager)],
+                        [scene respondsToSelector:@selector(systemGestureManager)] &&
+                            [[(UIWindowScene *)scene systemGestureManager]
+                                respondsToSelector:@selector(addGestureRecognizer:withType:)]);
+        if (!windowScene) {
             continue;
         }
         [self attachToScene:(UIWindowScene *)scene];
@@ -208,9 +277,11 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
     if (scene == nil || [self.attachedScenes containsObject:scene]) {
         return;
     }
-    UISystemGestureManager *manager = [scene systemGestureManager];
-    if (manager == nil || ![manager respondsToSelector:@selector(addGestureRecognizer:withType:)]) {
-        os_log(EdgeURLGestureLog(), "no system gesture manager on scene %{public}@", NSStringFromClass([scene class]));
+    UISystemGestureManager *manager = [self gestureManagerForScene:scene];
+    if (manager == nil) {
+        os_log(EdgeURLGestureLog(), "skipped scene %{public}@: not a main display scene with a system gesture manager",
+               NSStringFromClass([scene class]));
+        EdgeURLDebugLog(@"skip %@", NSStringFromClass([scene class]));
         return;
     }
     EdgeURLSettings *settings = [self currentSettings];
@@ -225,8 +296,12 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
     }
     [manager addGestureRecognizer:self.recognizer withType:settings.gestureType];
     [self.attachedScenes addObject:scene];
+    EdgeURLDebugLog(@"attached %@ type=%lu display=%@ recognizer=%@",
+                    NSStringFromClass([scene class]), (unsigned long)settings.gestureType,
+                    NSStringFromCGRect([UIScreen mainScreen].coordinateSpace.bounds), self.recognizer);
     os_log(EdgeURLGestureLog(),
-           "attached scene type=%lu display=%{public}@",
+           "attached scene %{public}@ type=%lu display=%{public}@",
+           NSStringFromClass([scene class]),
            (unsigned long)settings.gestureType,
            NSStringFromCGRect([UIScreen mainScreen].coordinateSpace.bounds));
 }
@@ -237,7 +312,10 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
         if (![scene isKindOfClass:[UIWindowScene class]]) {
             continue;
         }
-        [[(UIWindowScene *)scene systemGestureManager] removeGestureRecognizer:self.recognizer];
+        UISystemGestureManager *manager = [self gestureManagerForScene:(UIWindowScene *)scene];
+        if ([manager respondsToSelector:@selector(removeGestureRecognizer:)]) {
+            [manager removeGestureRecognizer:self.recognizer];
+        }
         [self.attachedScenes removeObject:scene];
     }
     os_log(EdgeURLGestureLog(), "re-attaching with type=%lu", (unsigned long)self.registeredGestureType);
@@ -269,13 +347,24 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
 }
 
 - (UIWindowScene *)activeScene {
+    UIWindowScene *eligible = nil;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if ([scene isKindOfClass:[UIWindowScene class]] &&
-            scene.activationState != UISceneActivationStateUnattached) {
-            return (UIWindowScene *)scene;
+        if (![scene isKindOfClass:[UIWindowScene class]] ||
+            scene.activationState == UISceneActivationStateUnattached) {
+            continue;
+        }
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        if ([self gestureManagerForScene:windowScene] == nil) {
+            continue;
+        }
+        if (EdgeURLSceneNameIsMainDisplay(NSStringFromClass([scene class]))) {
+            return windowScene;
+        }
+        if (eligible == nil) {
+            eligible = windowScene;
         }
     }
-    return nil;
+    return eligible;
 }
 
 // A recognizer the system gesture manager owns has no view, so the touch
@@ -357,6 +446,7 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
     CGPoint point = [self displayPointForTouch:touch];
     self.touchDown = point;
     self.touchDownValid = YES;
+    EdgeURLDebugLog(@"touch down (%.1f,%.1f)", point.x, point.y);
 
     EdgeURLSettings *settings = [self currentSettings];
     EdgeURLEdge edge = EdgeURLEdgeLeft;
@@ -390,9 +480,14 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
                "not in band down=(%.1f,%.1f) derived=(%.1f,%.1f) display=%{public}@",
                self.touchDown.x, self.touchDown.y, derived.x, derived.y,
                NSStringFromCGRect([self displayBounds]));
+        EdgeURLDebugLog(@"shouldBegin NO: down (%.1f,%.1f) derived (%.1f,%.1f) display %@",
+                        self.touchDown.x, self.touchDown.y, derived.x, derived.y,
+                        NSStringFromCGRect([self displayBounds]));
         return NO;
     }
     self.pendingEdge = edge;
+    EdgeURLDebugLog(@"shouldBegin YES edge=%d down (%.1f,%.1f)",
+                    (int)edge, self.touchDown.x, self.touchDown.y);
     os_log(EdgeURLGestureLog(),
            "should begin edge=%{public}s down=(%.1f,%.1f) derived=(%.1f,%.1f) display=%{public}@ band=%.1f",
            EdgeURLGestureName(edge).UTF8String,
@@ -436,6 +531,7 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
 
     os_log(EdgeURLGestureLog(), "tracking edge=%{public}s down=(%.1f,%.1f)",
            EdgeURLGestureName(self.activeEdge).UTF8String, self.touchDown.x, self.touchDown.y);
+    EdgeURLDebugLog(@"tracking edge=%d", (int)self.activeEdge);
 }
 
 - (CGFloat)progressForTravel:(CGFloat)travel settings:(EdgeURLSettings *)settings {
@@ -483,6 +579,7 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
            "end edge=%{public}s travel=%.1f minTravel=%.1f cancelled=%d opens=%d",
            EdgeURLGestureName(self.activeEdge).UTF8String, travel,
            settings.minimumTravel, cancelled, opens);
+    EdgeURLDebugLog(@"end edge=%d travel=%.1f opens=%d", (int)self.activeEdge, travel, opens);
 
     [self finishWithProgress:progress opens:opens];
 }
