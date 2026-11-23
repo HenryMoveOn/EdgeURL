@@ -55,4 +55,18 @@
 @end
 
 @implementation EdgeURLBandWindow
+
+// The window is above every app's, so the display's own hit test reaches it
+// first. It answers none: no point of it is a hit, and the search goes on to the
+// windows below. This says the same thing the window's userInteractionEnabled
+// does, but it is the window's own answer rather than a flag the display has to
+// respect, and it holds whatever sets that flag.
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    return nil;
+}
+
+- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
+    return NO;
+}
+
 @end

@@ -596,6 +596,12 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
 // SpringBoard's own windows, never to a window of ours, so a touch under the
 // finger keeps going exactly where it went before; the watcher only looks at
 // where it landed and cancels nothing.
+//
+// Only the desktop's own windows take one. The gesture belongs to the desktop —
+// the delegate never begins it while the desktop is covered — and a watcher on
+// any other SpringBoard window is a watcher on something that is not this
+// tweak's to watch: Spotlight's search window, the keyboard's text effects
+// window, an alert. They are left alone, touch handling and all.
 - (NSArray<UIView *> *)touchHostsInScene:(UIWindowScene *)scene {
     NSMutableArray<UIView *> *hosts = [NSMutableArray array];
     for (UIWindow *window in scene.windows) {
@@ -607,7 +613,7 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
             continue;
         }
         NSString *name = NSStringFromClass([window class]);
-        if ([name containsString:@"EdgeURL"] || [name containsString:@"Keyboard"]) {
+        if (![name containsString:@"HomeScreen"]) {
             continue;
         }
         [hosts addObject:window];
