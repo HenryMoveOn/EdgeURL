@@ -932,14 +932,13 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     [self recedeFromProgress:MAX(EdgeURLFraction(progress), 0.25)];
     if (opens) {
         [self performHapticIfEnabled:settings.haptic];
-        // The panel recedes first: opening straight away would take the desktop
-        // away and the animation with it before it had been seen. Android's own
-        // commit is shorter than this, so the wait is under a fifth of a second.
-        NSURL *url = settings.URL;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(EdgeURLFadeDuration * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [self openURL:url];
-        });
+        // The URL opens the moment the finger lifts, which is Android's own
+        // commit: the swipe is done, so the action is taken. Waiting for the panel
+        // to recede first put nearly a fifth of a second between the two, and a
+        // touch made in that gap had nothing to act on yet, so the screen seemed
+        // to stall. The panel still recedes underneath whatever the URL brings up,
+        // and the desktop shows the recede when the URL brings up nothing.
+        [self openURL:settings.URL];
     }
 }
 
