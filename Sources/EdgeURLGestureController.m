@@ -2,25 +2,27 @@
 //
 // The trigger area on the desktop, done the way HomeBarURL does it.
 //
-// This dylib is loaded into SpringBoard and nowhere else. One window of its own
-// carries both the drawing and the sensing. The drawing is a full-screen view
-// that never takes a touch; the sensing is one transparent view per enabled edge,
-// exactly the band's rect. The window answers -hitTest: with that view inside the
-// band and with nil everywhere else, so a touch anywhere else on the desktop goes
-// to the window below it, untouched.
+// This dylib is loaded into SpringBoard and nowhere else. Everything it draws
+// lives inside SpringBoard's own home screen window, which the display keeps
+// below every app's window: the band and the wave are therefore covered by an
+// app by the mere fact of the window order, and no touch of an app can ever
+// reach this tweak — not in the band, not anywhere.
 //
 // What ended the earlier attempts, so it is not tried again: UISystemGestureManager
-// (its refusals locked SpringBoard's touches), and a SpringBoard window left up
-// while an app was in front (the app then lost every touch, because a touch that
-// reaches SpringBoard in the display's hit test cannot be handed back to another
-// process). The window is hidden while anything but the desktop is on screen, so
-// an app is never behind it.
+// (its refusals locked SpringBoard's touches), and a window of this tweak's own
+// above the apps (a touch that reaches SpringBoard in the display's hit test
+// cannot be handed back to another process, so the app lost it for good).
+//
+// The swipe itself is watched by recognizers attached to SpringBoard's own
+// desktop windows: those windows already receive the desktop's touches, and the
+// recognizers cancel nothing (cancelsTouchesInView = NO, and neither can prevent
+// nor be prevented), so icons, page scrolling and every other gesture under the
+// finger work as before.
 //
 // All hit testing is done in display coordinates, the screen's coordinate space.
 #import "EdgeURLGestureController.h"
 
 #import "EdgeURLIndicatorView.h"
-#import "EdgeURLOverlayWindow.h"
 #import "EdgeURLPanRecognizer.h"
 #import "EdgeURLSettings.h"
 
@@ -32,7 +34,9 @@
 #import <stdarg.h>
 #import <unistd.h>
 
-static const CFTimeInterval EdgeURLFadeDuration = 0.22;
+// The wave goes back into the edge in this long; Android's own cancel takes a
+// little less than a fifth of a second.
+static const CFTimeInterval EdgeURLFadeDuration = 0.18;
 
 // TEMPORARY diagnostic: os_log only answers live listeners, so the same lines
 // also go to a file that survives the gesture.
@@ -92,8 +96,10 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
 @interface EdgeURLGestureController () <EdgeURLPanRecognizerDelegate>
 
 @property (nonatomic, strong) EdgeURLIndicatorView *indicatorView;
-@property (nonatomic, strong) EdgeURLOverlayWindow *overlayWindow;
-@property (nonatomic, strong) NSArray<UIView *> *sensingViews;
+/// SpringBoard's home screen window: what this tweak draws into, and the window
+/// the display keeps below every app.
+@property (nonatomic, strong) UIView *desktopView;
+@property (nonatomic, strong) NSArray<UIView *> *hostWindows;
 @property (nonatomic, strong) NSMutableArray<EdgeURLPanRecognizer *> *recognizers;
 @property (nonatomic, strong) CADisplayLink *fadeLink;
 @property (nonatomic, strong) EdgeURLSettings *settings;
@@ -101,6 +107,9 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
 @property (nonatomic, assign) BOOL started;
 @property (nonatomic, assign) BOOL watchdogStarted;
 @property (nonatomic, assign) BOOL loggedWindows;
+
+@property (nonatomic, copy) NSString *bandStateKey;
+@property (nonatomic, copy) NSString *gateStateKey;
 
 @property (nonatomic, assign) EdgeURLEdge activeEdge;
 @property (nonatomic, assign) CGPoint touchDown;
@@ -127,7 +136,7 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _sensingViews = @[];
+        _hostWindows = @[];
         _recognizers = [NSMutableArray array];
         _activeEdge = EdgeURLEdgeLeft;
     }
@@ -198,9 +207,11 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
     });
 }
 
-// Two seconds apart, and each tick schedules the next one itself: the desktop
-// comes and goes many times a session, and this is what notices a scene that was
-// replaced while nothing was posted.
+// Six tenths of a second apart, and each tick schedules the next one itself: the
+// desktop window is rebuilt across lock, unlock and respring, and this is what
+// puts the drawing back into the new one. It only keeps the drawing in step with
+// what is on screen — touches are handled by the desktop's own recognizers, so a
+// late tick can never take one.
 - (void)startWatchdog {
     if (self.watchdogStarted) {
         return;
@@ -211,7 +222,7 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
 
 - (void)scheduleWatchdogTick {
     __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         [weakSelf watchdogTick];
     });
@@ -278,8 +289,10 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     return fallback;
 }
 
-// The trigger area belongs to the desktop, so it is on screen exactly while the
-// desktop is: not while an app is in front, and not over the lock screen.
+// The desktop is on screen exactly while its own window is not covered by an app
+// or by the lock screen. Drawing does not depend on this — it is inside the home
+// screen window, so an app covers it whatever this says — but the trigger must
+// not fire from inside an app.
 - (BOOL)shouldShowInScene:(UIWindowScene *)scene {
     if (scene == nil) {
         return NO;
@@ -291,17 +304,11 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
 }
 
 - (BOOL)homeScreenIsShowingInScene:(UIWindowScene *)scene {
-    for (UIWindow *window in scene.windows) {
-        if (![NSStringFromClass([window class]) containsString:@"HomeScreen"]) {
-            continue;
-        }
-        if (!window.hidden && window.alpha > 0.01) {
-            return YES;
-        }
+    UIWindow *desktop = (UIWindow *)[self desktopViewInScene:scene];
+    if (desktop == nil) {
+        return NO;
     }
-    // A hidden home screen window is an app in front; no home screen window at
-    // all is SpringBoard still starting up. Neither is the place to draw.
-    return NO;
+    return !desktop.hidden && desktop.alpha > 0.01;
 }
 
 // The lock screen is another window of the same scene, and the band belongs to
@@ -391,7 +398,27 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     return MAX(0.0, travel);
 }
 
-#pragma mark - Overlay
+#pragma mark - Host
+
+// The home screen window, found by name in SpringBoard's own scene. It carries
+// the wallpaper and the icons at a window level below every app's, which is what
+// makes it the one place a desktop overlay can live without ever coming between
+// an app and a touch.
+- (UIView *)desktopViewInScene:(UIWindowScene *)scene {
+    UIWindow *best = nil;
+    for (UIWindow *window in scene.windows) {
+        if (![NSStringFromClass([window class]) containsString:@"HomeScreen"]) {
+            continue;
+        }
+        if (CGRectGetWidth(window.bounds) < 2.0 || CGRectGetHeight(window.bounds) < 2.0) {
+            continue;
+        }
+        if (best == nil || window.windowLevel < best.windowLevel) {
+            best = window;
+        }
+    }
+    return best;
+}
 
 - (void)reconcile {
     UIWindowScene *scene = [self mainScene];
@@ -399,77 +426,132 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
         EdgeURLDebugLog(@"no window scene yet");
         return;
     }
-    BOOL show = [self shouldShowInScene:scene];
-    [self updateOverlayForScene:scene shown:show];
-    if (!show && self.active) {
-        // The desktop left the screen while a swipe was running: drop it.
-        self.active = NO;
-    }
+    [self attachToDesktopInScene:scene];
+    [self syncRecognizersInScene:scene];
+    [self updateTriggerAreas];
     if (!self.loggedWindows) {
         self.loggedWindows = YES;
-        [self logDesktopStateInScene:scene shown:show];
+        [self logDesktopStateInScene:scene];
+    }
+    [self logGateStateInScene:scene];
+}
+
+- (void)attachToDesktopInScene:(UIWindowScene *)scene {
+    UIView *desktop = [self desktopViewInScene:scene];
+    if (desktop == nil) {
+        [self.indicatorView removeFromSuperview];
+        self.desktopView = nil;
+        return;
+    }
+    if (self.desktopView != desktop) {
+        [self.indicatorView removeFromSuperview];
+        self.desktopView = desktop;
+        EdgeURLDebugLog(@"desktop window %@ level=%.1f",
+                        NSStringFromClass([desktop class]), ((UIWindow *)desktop).windowLevel);
+    }
+    EdgeURLIndicatorView *view = self.indicatorView;
+    CGRect frame = [self frameForDesktopView:desktop];
+    if (view.superview != desktop) {
+        view.frame = frame;
+        view.autoresizingMask = UIViewAutoresizingNone;
+        [desktop addSubview:view];
+        EdgeURLDebugLog(@"indicator attached frame=%@ bounds=%@",
+                        NSStringFromCGRect(frame), NSStringFromCGRect(desktop.bounds));
+        return;
+    }
+    if (!CGRectEqualToRect(view.frame, frame)) {
+        view.frame = frame;
+    }
+    if (desktop.subviews.lastObject != view) {
+        [desktop bringSubviewToFront:view];
     }
 }
 
-// EdgeURL's window: created once per scene, hidden whenever the desktop is not
-// what the screen shows. A scene that is replaced — on a respring, and around
-// lock and unlock — takes the window with it, and a new one is made here.
-- (void)updateOverlayForScene:(UIWindowScene *)scene shown:(BOOL)show {
-    if (self.overlayWindow != nil && self.overlayWindow.windowScene != scene) {
-        [self detachRecognizers];
-        self.overlayWindow.hidden = YES;
-        self.overlayWindow = nil;
-        EdgeURLDebugLog(@"overlay window dropped with its scene");
-    }
-    BOOL created = NO;
-    if (self.overlayWindow == nil) {
-        EdgeURLOverlayWindow *window = [[EdgeURLOverlayWindow alloc] initWithWindowScene:scene];
-        window.frame = [self displayBounds];
-        self.overlayWindow = window;
-        self.indicatorView.frame = window.bounds;
-        self.indicatorView.autoresizingMask =
-            UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-        window.displayView = self.indicatorView;
-        [window addSubview:self.indicatorView];
-        [self createSensingViewsForWindow:window];
-        window.hidden = !show;
-        created = YES;
-        EdgeURLDebugLog(@"overlay window ready level=%.1f bounds=%@",
-                        window.windowLevel, NSStringFromCGRect(window.bounds));
-    } else if (self.overlayWindow.hidden != (!show)) {
-        self.overlayWindow.hidden = !show;
-        EdgeURLDebugLog(@"overlay window %@", show ? @"shown" : @"hidden");
-    }
-    if (self.overlayWindow.frame.size.width < 2.0 ||
-        self.overlayWindow.frame.size.height < 2.0) {
-        self.overlayWindow.frame = [self displayBounds];
-    }
-    [self updateSensingViewsShown:show];
-    if (created) {
-        [self updateTriggerAreas];
-    }
+// The view's frame, in the desktop window's own coordinates, is the display:
+// drawing then happens in display coordinates, which is what the recognizers
+// report in too.
+- (CGRect)frameForDesktopView:(UIView *)desktop {
+    return [desktop convertRect:[self displayBounds]
+             fromCoordinateSpace:[UIScreen mainScreen].coordinateSpace];
 }
 
-// One transparent view per edge, and one recognizer on each. They are made once
-// and only resized afterwards, so a running touch can never lose the view it
-// started on.
-- (void)createSensingViewsForWindow:(EdgeURLOverlayWindow *)window {
-    NSMutableArray<UIView *> *views = [NSMutableArray array];
-    for (NSInteger index = 0; index < 2; index++) {
-        UIView *view = [[UIView alloc] initWithFrame:CGRectZero];
-        view.backgroundColor = [UIColor clearColor];
-        view.opaque = NO;
-        view.hidden = YES;
-        [window addSubview:view];
+// One watcher per window the desktop can put a touch into. They are attached to
+// SpringBoard's own windows, never to a window of ours, so a touch under the
+// finger keeps going exactly where it went before; the watcher only looks at
+// where it landed and cancels nothing.
+- (NSArray<UIView *> *)touchHostsInScene:(UIWindowScene *)scene {
+    NSMutableArray<UIView *> *hosts = [NSMutableArray array];
+    for (UIWindow *window in scene.windows) {
+        if (window.hidden || window.alpha <= 0.01) {
+            continue;
+        }
+        if (CGRectGetWidth(window.bounds) < 2.0 ||
+            CGRectGetHeight(window.bounds) < 2.0) {
+            continue;
+        }
+        NSString *name = NSStringFromClass([window class]);
+        if ([name containsString:@"EdgeURL"] || [name containsString:@"Keyboard"]) {
+            continue;
+        }
+        [hosts addObject:window];
+    }
+    return hosts;
+}
+
+// Rebuilt only when the set of windows changed, and never in the middle of a
+// swipe: the recognizer that began it has to stay where it is. Compared as a
+// set, because the scene hands its windows back in whatever order it likes, and
+// only the difference is touched: SpringBoard shows and hides its own windows
+// constantly, and re-installing every watcher each time is wasted work.
+- (void)syncRecognizersInScene:(UIWindowScene *)scene {
+    if (self.active) {
+        return;
+    }
+    NSArray<UIView *> *hosts = [self touchHostsInScene:scene];
+    NSSet<UIView *> *current = [NSSet setWithArray:hosts];
+    NSMutableSet<UIView *> *watched = [NSMutableSet set];
+    for (EdgeURLPanRecognizer *recognizer in [self.recognizers copy]) {
+        UIView *view = recognizer.view;
+        if (view != nil) {
+            [watched addObject:view];
+        }
+    }
+    BOOL changed = NO;
+    NSUInteger removed = 0;
+    NSUInteger added = 0;
+    // Watchers whose window is gone, or no longer visible.
+    for (EdgeURLPanRecognizer *recognizer in [self.recognizers copy]) {
+        UIView *view = recognizer.view;
+        if (view != nil && [current containsObject:view]) {
+            continue;
+        }
+        if (view != nil) {
+            [view removeGestureRecognizer:recognizer];
+        }
+        [self.recognizers removeObject:recognizer];
+        removed++;
+        changed = YES;
+    }
+    // Windows that can put a touch into the desktop and have no watcher yet.
+    for (UIView *host in hosts) {
+        if ([watched containsObject:host]) {
+            continue;
+        }
         EdgeURLPanRecognizer *recognizer =
-            [[EdgeURLPanRecognizer alloc] initWithTarget:self action:@selector(handleEdgePan:)];
+            [[EdgeURLPanRecognizer alloc] initWithTarget:self
+                                                  action:@selector(handleEdgePan:)];
         recognizer.edgeDelegate = self;
-        [view addGestureRecognizer:recognizer];
+        [host addGestureRecognizer:recognizer];
         [self.recognizers addObject:recognizer];
-        [views addObject:view];
+        added++;
+        changed = YES;
     }
-    self.sensingViews = views;
-    window.sensingViews = views;
+    self.hostWindows = hosts;
+    if (changed) {
+        EdgeURLDebugLog(@"watchers %lu (+%lu -%lu)",
+                        (unsigned long)self.recognizers.count,
+                        (unsigned long)added, (unsigned long)removed);
+    }
 }
 
 - (void)detachRecognizers {
@@ -480,48 +562,38 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
         }
     }
     [self.recognizers removeAllObjects];
-    self.sensingViews = @[];
-}
-
-// The sensing rects follow the settings: the same rect the band is drawn in, so
-// the area that is visible and the area that answers a finger cannot disagree.
-- (void)updateSensingViewsShown:(BOOL)shown {
-    EdgeURLSettings *settings = [self currentSettings];
-    for (NSInteger index = 0; index < (NSInteger)self.sensingViews.count; index++) {
-        BOOL left = (index == 0);
-        UIView *view = self.sensingViews[(NSUInteger)index];
-        BOOL on = shown && settings.enabled &&
-                  (left ? settings.leftEdge : settings.rightEdge);
-        CGRect rect = on ? [self bandRectForSettings:settings left:left] : CGRectZero;
-        if (on && !CGRectEqualToRect(view.frame, rect)) {
-            view.frame = rect;
-            EdgeURLDebugLog(@"sensing %@ frame=%@", left ? @"left" : @"right",
-                            NSStringFromCGRect(rect));
-        }
-        if (view.hidden == on) {
-            view.hidden = !on;
-            EdgeURLDebugLog(@"sensing %@ %@", left ? @"left" : @"right",
-                            on ? @"armed" : @"dormant");
-        }
-    }
-    [self updateTriggerAreas];
+    self.hostWindows = @[];
 }
 
 // TEMPORARY diagnostic: what the desktop's scene holds, so a window of another
 // tweak that sits above this one can be named.
-- (void)logDesktopStateInScene:(UIWindowScene *)scene shown:(BOOL)show {
-    EdgeURLDebugLog(@"scene %@ state=%ld show=%d",
-                    NSStringFromClass([scene class]), (long)scene.activationState, show);
+- (void)logDesktopStateInScene:(UIWindowScene *)scene {
+    EdgeURLDebugLog(@"scene %@ state=%ld", NSStringFromClass([scene class]),
+                    (long)scene.activationState);
     for (UIWindow *window in scene.windows) {
-        if (window.windowLevel < 900.0 && ![NSStringFromClass([window class]) containsString:@"HomeScreen"]) {
-            continue;
-        }
         EdgeURLDebugLog(@"  win %@ level=%.1f hidden=%d alpha=%.2f frame=%@",
                         NSStringFromClass([window class]), window.windowLevel,
                         window.hidden, window.alpha, NSStringFromCGRect(window.frame));
-        os_log(EdgeURLGestureLog(), "win %{public}@ level=%.1f hidden=%d",
-               NSStringFromClass([window class]), window.windowLevel, window.hidden);
     }
+}
+
+// TEMPORARY diagnostic: the trigger must not fire from inside an app, and the
+// only thing that says whether an app is in front is how SpringBoard's home
+// screen window looks at that moment. Logged whenever it changes.
+- (void)logGateStateInScene:(UIWindowScene *)scene {
+    UIWindow *desktop = (UIWindow *)[self desktopViewInScene:scene];
+    NSString *key = [NSString stringWithFormat:@"%@|%d|%.2f|%d|%d",
+                     NSStringFromClass([desktop class]), desktop.hidden, desktop.alpha,
+                     [self coverSheetIsUpInScene:scene],
+                     [self homeScreenIsShowingInScene:scene]];
+    if ([key isEqualToString:self.gateStateKey]) {
+        return;
+    }
+    self.gateStateKey = key;
+    EdgeURLDebugLog(@"gate desktop=%@ hidden=%d alpha=%.2f cover=%@ show=%d",
+                    NSStringFromClass([desktop class]), desktop.hidden, desktop.alpha,
+                    [self coverSheetIsUpInScene:scene] ? @"yes" : @"no",
+                    [self homeScreenIsShowingInScene:scene]);
 }
 
 - (void)sceneDidChange:(NSNotification *)notification {
@@ -540,6 +612,19 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     // One swipe at a time: both edge views can hold a recognizer, and this one
     // gesture must not be run twice.
     if (self.active) {
+        return NO;
+    }
+    // The watchers stay on SpringBoard's windows for the whole session; this is
+    // what keeps them quiet while an app or the lock screen is what is on show.
+    UIWindowScene *scene = recognizer.view.window.windowScene;
+    BOOL cover = [self coverSheetIsUpInScene:scene];
+    BOOL showing = [self homeScreenIsShowingInScene:scene];
+    if (!showing || cover) {
+        UIWindow *desktop = (UIWindow *)[self desktopViewInScene:scene];
+        EdgeURLDebugLog(@"touch down ignored: cover=%d desktop=%@ hidden=%d alpha=%.2f scene=%@ window=%@",
+                        cover, NSStringFromClass([desktop class]), desktop.hidden, desktop.alpha,
+                        NSStringFromClass([scene class]),
+                        NSStringFromClass([recognizer.view.window class]));
         return NO;
     }
     CGPoint display = [self displayPointForViewPoint:point inView:recognizer.view];
@@ -604,9 +689,12 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
                     NSStringFromClass([recognizer.view.window class]));
 }
 
+// Progress is how far the finger has left the edge, over a distance the size of
+// the gesture itself rather than the few points that open it: the panel grows
+// while the finger travels, all the way to the middle of the screen.
 - (CGFloat)progressForTravel:(CGFloat)travel settings:(EdgeURLSettings *)settings {
-    CGFloat threshold = MAX(settings.threshold, 1.0);
-    return MIN(1.0, MAX(0.0, travel / threshold));
+    CGFloat span = MAX(settings.threshold, 110.0);
+    return MIN(1.0, MAX(0.0, travel / span));
 }
 
 - (void)updateEdgePan:(EdgeURLPanRecognizer *)recognizer {
@@ -629,7 +717,7 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
         UIImpactFeedbackGenerator *generator =
             [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
         [generator impactOccurred];
-        os_log(EdgeURLAnimationLog(), "wave at full brightness travel=%.1f threshold=%.1f",
+        os_log(EdgeURLAnimationLog(), "panel at full size travel=%.1f threshold=%.1f",
                travel, settings.threshold);
     } else if (progress < 1.0) {
         self.brightened = NO;
@@ -664,10 +752,11 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     self.active = NO;
     [self recedeFromProgress:MAX(EdgeURLFraction(progress), 0.25)];
     if (opens) {
-        // The wave recedes first: opening straight away would hide the desktop,
-        // and the animation with it, before it had been seen.
+        // The panel recedes first: opening straight away would take the desktop
+        // away and the animation with it before it had been seen. Android's own
+        // commit is shorter than this, so the wait is under a fifth of a second.
         NSURL *url = settings.URL;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(EdgeURLFadeDuration * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             [self openURL:url];
         });
@@ -703,18 +792,19 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     return _indicatorView;
 }
 
-// The view is hosted in EdgeURL's own window, so it lives exactly as long as the
-// desktop is on show. Geometry comes from the settings, once.
+// Geometry comes from the settings, once per change; the view itself lives in
+// the desktop window, so it is there exactly as long as the desktop is.
 - (BOOL)prepareIndicatorWithSettings:(EdgeURLSettings *)settings {
-    if (self.overlayWindow == nil || self.indicatorView.superview == nil) {
+    UIView *desktop = self.desktopView;
+    if (desktop == nil || self.indicatorView.superview != desktop) {
         return NO;
     }
-    CGRect bounds = self.overlayWindow.bounds;
-    if (CGRectGetWidth(bounds) < 2.0 || CGRectGetHeight(bounds) < 2.0) {
+    CGRect frame = [self frameForDesktopView:desktop];
+    if (CGRectGetWidth(frame) < 2.0 || CGRectGetHeight(frame) < 2.0) {
         return NO;
     }
-    if (!CGRectEqualToRect(self.indicatorView.frame, bounds)) {
-        self.indicatorView.frame = bounds;
+    if (!CGRectEqualToRect(self.indicatorView.frame, frame)) {
+        self.indicatorView.frame = frame;
     }
     EdgeURLIndicatorView *view = self.indicatorView;
     view.bandWidth = settings.edgeWidth;
@@ -737,8 +827,18 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
         return;
     }
     if (self.active) {
-        return;  // A swipe is drawing its own wave over the band.
+        return;  // A swipe is drawing its own panel over the band.
     }
+    NSString *stateKey = [NSString stringWithFormat:@"%@|%d|%d|%d|%.2f|%.1f|%.1f|%.1f|%d|%.0fx%.0f",
+                           settings.summary, settings.enabled, settings.leftEdge,
+                           settings.rightEdge, settings.areaAlpha, settings.edgeWidth,
+                           settings.regionTop, settings.regionHeight, settings.showArea,
+                           CGRectGetWidth(self.indicatorView.bounds),
+                           CGRectGetHeight(self.indicatorView.bounds)];
+    if ([stateKey isEqualToString:self.bandStateKey]) {
+        return;  // Nothing about the band changed; it is already on screen.
+    }
+    self.bandStateKey = stateKey;
     [self stopFade];
     EdgeURLIndicatorView *view = self.indicatorView;
     view.previewMode = YES;
@@ -751,15 +851,15 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
            "trigger areas shown left=%d right=%d alpha=%.2f width=%.1f top=%.1f height=%.1f",
            settings.leftEdge, settings.rightEdge, settings.areaAlpha,
            settings.edgeWidth, settings.regionTop, settings.regionHeight);
-    EdgeURLDebugLog(@"band shown left=%d right=%d alpha=%.2f show=%d hidden=%d",
+    EdgeURLDebugLog(@"band shown left=%d right=%d alpha=%.2f show=%d",
                     settings.leftEdge, settings.rightEdge, settings.areaAlpha,
-                    settings.showArea, self.overlayWindow.hidden);
+                    settings.showArea);
 }
 
-// The wave goes back the way it came: the capsule shrinks into the edge, and
-// only the last part of that fades out. This is how Android's back gesture
-// leaves the screen, and it reads as the finger pulling the wave back rather
-// than a bar blinking off.
+// The panel goes back the way it came: it shrinks into the edge, and only the
+// last part of that fades out. This is how Android's back gesture leaves the
+// screen, and it reads as the finger pulling the panel back rather than a shape
+// blinking off.
 - (void)recedeFromProgress:(CGFloat)progress {
     if (self.indicatorView.superview == nil) {
         return;
@@ -776,7 +876,7 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     CFTimeInterval elapsed = CACurrentMediaTime() - self.fadeStartTime;
     CGFloat unit = EdgeURLFadeDuration > 0.0 ? (CGFloat)(elapsed / EdgeURLFadeDuration) : 1.0;
     CGFloat t = MIN(1.0, MAX(0.0, unit));
-    // Ease out, so the wave shoots back towards the edge and settles there.
+    // Ease out, so the panel shoots back towards the edge and settles there.
     CGFloat eased = 1.0 - pow(1.0 - t, 3.0);
     self.indicatorView.progress = self.fadeFromProgress * (1.0 - eased);
     CGFloat remaining = (t > 0.55) ? (1.0 - (t - 0.55) / 0.45) : 1.0;
@@ -786,7 +886,8 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
         [self stopFade];
         self.indicatorView.alpha = 1.0;
         self.indicatorView.progress = 0.0;
-        // The wave is gone; the trigger area it covered comes back.
+        // The panel is gone; the trigger area it covered comes back.
+        self.bandStateKey = nil;
         [self updateTriggerAreas];
     }
 }
