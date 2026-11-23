@@ -1,23 +1,31 @@
 // SPDX-License-Identifier: MIT
 //
-// Touch capture, SpringBoard only. The tweak is injected into SpringBoard and
-// nothing else, so the gesture is taken from the windows SpringBoard itself
-// puts under the finger: on the home screen that is its own window, which is
-// also where the trigger band and the wave are drawn. No system gesture
-// manager is asked for anything (its refusals are what ended SpringBoard
-// before), and no window of the tweak's own ever sits above everything: the
-// indicator is a non-interactive subview of the home screen window, so it
-// appears exactly where it makes sense and goes away with the home screen.
+// Touch capture. The tweak is loaded into every app as well as SpringBoard,
+// because a window of SpringBoard's cannot draw over an app without also taking
+// every touch on the screen: the touch belongs to another process, and SpringBoard
+// has no way to hand it back. So each process draws and watches its own screen —
+// SpringBoard while the desktop is in front, an app while that app is in front —
+// and a touch that is not on the sensing area never leaves the process it
+// reached. What that costs is the one thing the earlier version could not do:
+// the band is drawn above the app's own content, never above SpringBoard's
+// system UI (status bar, Control Centre), which is a different process's scene.
+//
+// Inside a process, the drawing is a full-screen canvas window that never takes
+// a touch, and the touching is one thin window per enabled edge, exactly the
+// sensing area. No system gesture manager is asked for anything (its refusals
+// are what ended SpringBoard before).
 //
 // All hit testing is done in display coordinates, the screen's coordinate
 // space, which does not rotate with the scene.
 #import "EdgeURLGestureController.h"
 
 #import "EdgeURLIndicatorView.h"
+#import "EdgeURLOverlayWindow.h"
 #import "EdgeURLPanRecognizer.h"
 #import "EdgeURLSettings.h"
 
 #import <QuartzCore/QuartzCore.h>
+#import <objc/runtime.h>
 #import <notify.h>
 #import <os/log.h>
 #import <fcntl.h>
@@ -81,6 +89,17 @@ static NSString *EdgeURLChangedNotification(void) {
     return @APELIN_PACKAGE_ID "/changed";
 }
 
+// SpringBoard is the one process whose "app in front" is the desktop; every other
+// process the filter loads into is an app, and there the front is the app itself.
+static BOOL EdgeURLIsSpringBoard(void) {
+    static BOOL springBoard;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        springBoard = (objc_getClass("SpringBoard") != Nil);
+    });
+    return springBoard;
+}
+
 static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
     return edge == EdgeURLEdgeLeft ? @"left" : @"right";
 }
@@ -89,6 +108,8 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
 
 @property (nonatomic, strong) NSMutableArray<EdgeURLPanRecognizer *> *recognizers;
 @property (nonatomic, strong) EdgeURLIndicatorView *indicatorView;
+@property (nonatomic, strong) EdgeURLOverlayWindow *overlayWindow;
+@property (nonatomic, strong) NSMutableArray<EdgeURLTouchWindow *> *edgeWindows;
 @property (nonatomic, weak) UIWindow *indicatorHost;
 @property (nonatomic, strong) CADisplayLink *fadeLink;
 @property (nonatomic, strong) EdgeURLSettings *settings;
@@ -123,6 +144,7 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
     self = [super init];
     if (self) {
         _recognizers = [NSMutableArray array];
+        _edgeWindows = [NSMutableArray array];
         _activeEdge = EdgeURLEdgeLeft;
     }
     return self;
@@ -272,14 +294,27 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
             continue;
         }
         UIWindowScene *windowScene = (UIWindowScene *)scene;
-        if (windowScene.screen == [UIScreen mainScreen]) {
+        if (windowScene.screen != [UIScreen mainScreen]) {
+            if (fallback == nil) {
+                fallback = windowScene;
+            }
+            continue;
+        }
+        // In an app the scene to draw in is the one in front, and only while it is:
+        // a scene in the background has no screen to draw on.
+        if (EdgeURLIsSpringBoard()) {
+            return windowScene;
+        }
+        if (scene.activationState == UISceneActivationStateForegroundActive) {
             return windowScene;
         }
         if (fallback == nil) {
             fallback = windowScene;
         }
     }
-    return fallback;
+    // An app with no scene in front draws nothing: its windows would belong to a
+    // background scene, and SpringBoard owns the screen then.
+    return EdgeURLIsSpringBoard() ? fallback : nil;
 }
 
 // Windows that are never the home screen's own surface, even when they happen
@@ -310,6 +345,9 @@ static BOOL EdgeURLWindowIsNoise(NSString *className) {
         if (EdgeURLWindowIsNoise(NSStringFromClass([window class]))) {
             continue;
         }
+        if (window.windowLevel >= EdgeURLOverlayWindowLevel) {
+            continue;  // EdgeURL's own canvas and touch windows.
+        }
         CGRect bounds = window.bounds;
         if (CGRectGetWidth(bounds) < CGRectGetWidth(screen) * 0.9 ||
             CGRectGetHeight(bounds) < CGRectGetHeight(screen) * 0.9) {
@@ -333,6 +371,131 @@ static BOOL EdgeURLWindowIsNoise(NSString *className) {
         }
     }
     return lowest;
+}
+
+// EdgeURL's own windows: a canvas above everything that draws, and one thin
+// window per enabled edge that takes the touches landing there. Recreated when
+// the scene is replaced, which happens on a respring and around lock and unlock.
+- (void)updateOverlayForScene:(UIWindowScene *)scene {
+    BOOL show = [self shouldShowInScene:scene];
+    if (self.overlayWindow != nil && self.overlayWindow.windowScene != scene) {
+        [self.indicatorView removeFromSuperview];
+        self.overlayWindow.hidden = YES;
+        self.overlayWindow = nil;
+        for (EdgeURLTouchWindow *window in self.edgeWindows) {
+            window.hidden = YES;
+        }
+    }
+    if (self.overlayWindow == nil) {
+        EdgeURLOverlayWindow *canvas = [[EdgeURLOverlayWindow alloc] initWithWindowScene:scene];
+        canvas.frame = [self displayBounds];
+        self.overlayWindow = canvas;
+        [canvas addSubview:self.indicatorView];
+        self.indicatorView.frame = canvas.bounds;
+        self.indicatorView.autoresizingMask =
+            UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        canvas.hidden = !show;
+        EdgeURLDebugLog(@"overlay canvas ready level=%.1f bounds=%@",
+                        canvas.windowLevel, NSStringFromCGRect(canvas.bounds));
+        [self updateTriggerAreas];
+    } else if (self.overlayWindow.hidden != (!show)) {
+        self.overlayWindow.hidden = !show;
+        EdgeURLDebugLog(@"overlay canvas %@", show ? @"shown" : @"hidden");
+    }
+    [self updateEdgeWindowsForScene:scene shown:show];
+}
+
+// Whether anything of EdgeURL's belongs on this scene at all. A window of this
+// process, however transparent and however much it refuses the touch, sits above
+// the whole screen: in SpringBoard that means above the app in front, and the
+// touch it refuses is then lost — SpringBoard cannot hand a touch back to another
+// process. So SpringBoard draws only while the desktop is the screen, and an app
+// draws only while that app is.
+- (BOOL)shouldShowInScene:(UIWindowScene *)scene {
+    if (scene == nil) {
+        return NO;
+    }
+    if (!EdgeURLIsSpringBoard()) {
+        return scene.activationState == UISceneActivationStateForegroundActive;
+    }
+    // The desktop is on screen exactly while SpringBoard's home screen window is.
+    // It is not while an app is in front, nor while the lock screen covers it.
+    if ([self coverSheetIsUpInScene:scene]) {
+        return NO;
+    }
+    return [self homeScreenIsShowingInScene:scene];
+}
+
+- (BOOL)homeScreenIsShowingInScene:(UIWindowScene *)scene {
+    for (UIWindow *window in scene.windows) {
+        if (![NSStringFromClass([window class]) containsString:@"HomeScreen"]) {
+            continue;
+        }
+        if (!window.hidden && window.alpha > 0.01) {
+            return YES;
+        }
+    }
+    // A hidden home screen window is an app in front; no home screen window at
+    // all is SpringBoard still starting up. Neither is the place to draw.
+    return NO;
+}
+
+// The lock screen is another window of the same scene, and the band belongs to
+// the screen behind it, not over it.
+- (BOOL)coverSheetIsUpInScene:(UIWindowScene *)scene {
+    for (UIWindow *window in scene.windows) {
+        if (![NSStringFromClass([window class]) containsString:@"CoverSheet"]) {
+            continue;
+        }
+        if (!window.hidden && window.alpha > 0.01) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// The sensing area, exactly: a window whose frame is the band of one edge, so a
+// touch anywhere else on the screen never reaches this tweak and the app under
+// it keeps working untouched.
+- (void)updateEdgeWindowsForScene:(UIWindowScene *)scene shown:(BOOL)shown {
+    EdgeURLSettings *settings = [self currentSettings];
+    CGRect display = [self displayBounds];
+    NSMutableArray<NSValue *> *strips = [NSMutableArray array];
+    if (settings.enabled && shown) {
+        CGFloat band = settings.edgeWidth + EdgeURLBandSlack;
+        CGFloat top = CGRectGetMinY(display) +
+                      CGRectGetHeight(display) * settings.regionTop / 100.0;
+        CGFloat height = CGRectGetHeight(display) * settings.regionHeight / 100.0;
+        if (settings.leftEdge) {
+            [strips addObject:[NSValue valueWithCGRect:
+                CGRectMake(CGRectGetMinX(display), top, band, height)]];
+        }
+        if (settings.rightEdge) {
+            [strips addObject:[NSValue valueWithCGRect:
+                CGRectMake(CGRectGetMaxX(display) - band, top, band, height)]];
+        }
+    }
+    while (self.edgeWindows.count < strips.count) {
+        EdgeURLTouchWindow *window = [[EdgeURLTouchWindow alloc] initWithWindowScene:scene];
+        [self.edgeWindows addObject:window];
+        EdgeURLDebugLog(@"touch window created level=%.1f", window.windowLevel);
+    }
+    for (NSUInteger index = 0; index < self.edgeWindows.count; index++) {
+        EdgeURLTouchWindow *window = self.edgeWindows[index];
+        if (index < strips.count) {
+            CGRect strip = strips[index].CGRectValue;
+            if (!CGRectEqualToRect(window.frame, strip)) {
+                window.frame = strip;
+                EdgeURLDebugLog(@"touch window %lu frame=%@", (unsigned long)index,
+                                NSStringFromCGRect(strip));
+            }
+            if (window.hidden) {
+                window.hidden = NO;
+            }
+        } else if (!window.hidden) {
+            window.hidden = YES;
+        }
+    }
 }
 
 - (EdgeURLPanRecognizer *)recognizerOnWindow:(UIWindow *)window {
@@ -384,7 +547,26 @@ static BOOL EdgeURLWindowIsNoise(NSString *className) {
         EdgeURLDebugLog(@"no window scene yet");
         return;
     }
-    NSArray<UIWindow *> *windows = [self candidateWindowsForScene:scene];
+    [self updateOverlayForScene:scene];
+    BOOL show = [self shouldShowInScene:scene];
+    if (!show && self.active) {
+        // This process stopped being the screen while a swipe was running: drop
+        // it, the URL is not opened from a screen the user cannot see.
+        self.active = NO;
+    }
+    NSArray<UIWindow *> *windows = show ? [self candidateWindowsForScene:scene]
+                                        : @[];
+
+    // Where the gesture may be seen: the process's own windows plus the sensing
+    // area of any edge window. Both are empty unless this process is the screen —
+    // a recognizer left on a window of SpringBoard's would take edge touches meant
+    // for the app in front, and open the URL from a screen the band is not on.
+    NSMutableArray<UIWindow *> *recognitionWindows = [NSMutableArray arrayWithArray:windows];
+    for (EdgeURLTouchWindow *window in self.edgeWindows) {
+        if (!window.hidden) {
+            [recognitionWindows addObject:window];
+        }
+    }
 
     EdgeURLDebugLog(@"reconcile scene=%@ candidates=%lu",
                     NSStringFromClass([scene class]), (unsigned long)windows.count);
@@ -405,7 +587,7 @@ static BOOL EdgeURLWindowIsNoise(NSString *className) {
     for (EdgeURLPanRecognizer *recognizer in [self.recognizers copy]) {
         UIView *view = recognizer.view;
         BOOL stillCandidate = NO;
-        for (UIWindow *window in windows) {
+        for (UIWindow *window in recognitionWindows) {
             if ((UIView *)window == view) {
                 stillCandidate = YES;
                 break;
@@ -422,7 +604,7 @@ static BOOL EdgeURLWindowIsNoise(NSString *className) {
                         view != nil ? NSStringFromClass([view class]) : @"(nil)");
     }
 
-    for (UIWindow *window in windows) {
+    for (UIWindow *window in recognitionWindows) {
         if ([self recognizerOnWindow:window] != nil) {
             continue;
         }
@@ -437,10 +619,13 @@ static BOOL EdgeURLWindowIsNoise(NSString *className) {
                NSStringFromClass([window class]), window.windowLevel);
     }
 
-    // The band and the wave live in the home screen's window; the recognizers
-    // sit on every full-screen window of the scene, so whichever one takes the
-    // touch, the gesture is seen.
-    UIWindow *host = [self indicatorHostForWindows:windows];
+    // The band and the wave are drawn on EdgeURL's own canvas window of this
+    // process; the process's own windows are only the fallback, for a case where
+    // that window could not be made.
+    UIWindow *host = self.overlayWindow;
+    if (host == nil) {
+        host = [self indicatorHostForWindows:windows];
+    }
     if (host != nil && (host != self.indicatorHost ||
                         self.indicatorView.superview != host)) {
         [self.indicatorView removeFromSuperview];
@@ -532,6 +717,11 @@ static BOOL EdgeURLWindowIsNoise(NSString *className) {
                           edge:(EdgeURLEdge *)edge {
     EdgeURLSettings *settings = [self currentSettings];
     if (!settings.enabled || settings.URL == nil) {
+        return NO;
+    }
+    // One swipe at a time: the touch window and the view under it can both hold a
+    // recognizer, and this one gesture must not be run twice.
+    if (self.active) {
         return NO;
     }
     CGPoint display = [self displayPointForViewPoint:point inView:recognizer.view];
