@@ -164,8 +164,8 @@
   "package": {
     "id": "local.apelin.edgeurl",
     "name": "EdgeURL",
-    "version": "0.5.0",
-    "description": "A translucent trigger band sits on the screen edge of the desktop and of every app; swipe in from it and an Android-style wave follows your finger, then recedes into the edge as the URL opens.",
+    "version": "0.5.1",
+    "description": "A translucent trigger band sits on the screen edge of the desktop; swipe in from it and an Android-style wave follows your finger, then recedes into the edge as the URL opens.",
     "icon": "https://owngoal-dev.github.io/Apelin/icons/wiki.qaq.apelin.dev.tweak.png",
     "author": "moveon",
     "section": "Tweaks",
@@ -190,8 +190,8 @@
     ],
     "tweakFilter": {
       "dylib": "tweak",
-      "classes": [
-        "UIApplication"
+      "bundles": [
+        "com.apple.springboard"
       ]
     }
   }

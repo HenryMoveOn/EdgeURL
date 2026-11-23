@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 OwnGoal Studio
 //
-// The tweak's only entry point, and it is loaded into every app as well as
-// SpringBoard. SpringBoard hooks its launch to start as soon as its scene is up;
-// an app starts a moment after its own launch, because a window of SpringBoard's
-// cannot draw over an app without swallowing that process's touches.
+// The tweak's only entry point. The package's filter selects SpringBoard and
+// nothing else: the trigger band belongs to the desktop, and no other process
+// has a reason to load this dylib.
 //
 // The build defines APELIN_PACKAGE_ID, APELIN_VERSION and APELIN_BUILD_ID as
 // string literals on every compile.
@@ -46,19 +45,9 @@ __attribute__((constructor)) static void TweakInitialize(void) {
 
     Class springBoard = objc_getClass("SpringBoard");
     if (springBoard == Nil) {
-        // An app. Its own launch is not SpringBoard's, so there is nothing to hook:
-        // the controller is started once the app has a scene to draw in, and again
-        // a little later in case the first attempt came too early. -start is
-        // idempotent and its watchdog keeps trying.
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [[EdgeURLGestureController sharedController] start];
-        });
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            [[EdgeURLGestureController sharedController] start];
-        });
-        return;  // Nothing else to install here.
+        // The filter should never let this load anywhere else; if it somehow
+        // does, there is nothing here to do.
+        return;
     }
     MSHookMessageEx(springBoard,
                     @selector(applicationDidFinishLaunching:),

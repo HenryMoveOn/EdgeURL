@@ -1,8 +1,7 @@
 #import "EdgeURLOverlayWindow.h"
 
-// Chosen to sit above the things other tweaks keep up here: this device has a
-// full-screen SGPanelWindow at 10000011 that took the key window on the desk-
-// top. Anything at or above this level belongs to EdgeURL.
+// Above everything else on the desktop, including the full-screen windows other
+// tweaks keep far above the normal level: this device has one at 10000011.
 const UIWindowLevel EdgeURLOverlayWindowLevel = (UIWindowLevel)10000200.0;
 
 @implementation EdgeURLOverlayWindow
@@ -13,10 +12,10 @@ const UIWindowLevel EdgeURLOverlayWindowLevel = (UIWindowLevel)10000200.0;
         self.windowLevel = EdgeURLOverlayWindowLevel;
         self.backgroundColor = [UIColor clearColor];
         self.opaque = NO;
-        // The canvas is drawn on and never touched: a window with its user
-        // interaction off is skipped by the system when it hands out touches,
-        // so nothing under it loses one.
-        self.userInteractionEnabled = NO;
+        // On, because the sensing views have to be reachable; the window itself
+        // still answers nil for every point outside them.
+        self.userInteractionEnabled = YES;
+        self.sensingViews = @[];
     }
     return self;
 }
@@ -29,33 +28,22 @@ const UIWindowLevel EdgeURLOverlayWindowLevel = (UIWindowLevel)10000200.0;
     return NO;
 }
 
-// Belt and braces: no point of the canvas is ever the target of a touch.
+// The whole point of this window: it takes the band and nothing else. Every
+// other point answers nil, so the system passes it to the window below, and the
+// desktop keeps working exactly as it did.
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
-    return nil;
-}
-
-@end
-
-@implementation EdgeURLTouchWindow
-
-- (instancetype)initWithWindowScene:(UIWindowScene *)scene {
-    self = [super initWithWindowScene:scene];
-    if (self) {
-        // Just above the canvas, so the sensing area is taken before anything
-        // drawn there and before any window of another tweak.
-        self.windowLevel = EdgeURLOverlayWindowLevel + 1.0;
-        self.backgroundColor = [UIColor clearColor];
-        self.opaque = NO;
+    if (self.hidden || self.alpha < 0.01 || !self.userInteractionEnabled) {
+        return nil;
     }
-    return self;
-}
-
-- (BOOL)canBecomeKeyWindow {
-    return NO;
-}
-
-- (BOOL)canBecomeFocused {
-    return NO;
+    for (UIView *view in self.sensingViews) {
+        if (view.hidden || view.alpha < 0.01 || !view.userInteractionEnabled) {
+            continue;
+        }
+        if (CGRectContainsPoint(view.frame, point)) {
+            return view;
+        }
+    }
+    return nil;
 }
 
 @end
