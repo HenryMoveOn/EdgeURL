@@ -23,12 +23,11 @@ static UIColor *EdgeURLTint(CGFloat alpha) {
 
 #pragma mark - The sensing area
 
-// The rest panel itself is 11 by 44 points; a finger needs more than that, so
-// the area it is sensed in is as tall as the configured region gives it, within
-// these bounds, and centred on the region's own middle. That is the whole of the
-// screen a swipe is taken from: everywhere else is left alone and undrawn.
-static const CGFloat EdgeURLSensingMinLength = 56.0;
-static const CGFloat EdgeURLSensingMaxLength = 96.0;
+// The rest panel itself is 11 by 44 points; a finger needs more than that, so the
+// area is never shorter than a finger's worth, however small the region is set.
+// Above that its length is the region's own, up to the whole edge: how much of the
+// edge is sensed is the setting's to say, and nothing here narrows that range.
+static const CGFloat EdgeURLSensingMinLength = 44.0;
 
 CGRect EdgeURLSensingRect(CGRect display,
                           BOOL left,
@@ -45,9 +44,7 @@ CGRect EdgeURLSensingRect(CGRect display,
                   displayHeight * EdgeURLClamped(regionTopPercent, 0.0, 100.0) / 100.0;
     CGFloat region = displayHeight * EdgeURLClamped(regionHeightPercent, 0.0, 100.0) / 100.0;
     region = MAX(1.0, MIN(region, CGRectGetMaxY(display) - top));
-    CGFloat length = MIN(EdgeURLClamped(region, EdgeURLSensingMinLength,
-                                        EdgeURLSensingMaxLength),
-                         displayHeight);
+    CGFloat length = MIN(MAX(region, EdgeURLSensingMinLength), displayHeight);
     CGFloat centerY = top + region * 0.5;
     CGFloat minY = EdgeURLClamped(centerY - length * 0.5,
                                   CGRectGetMinY(display),
