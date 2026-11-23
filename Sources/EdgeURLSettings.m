@@ -83,8 +83,8 @@ static NSURL *EdgeURLParseURL(NSString *raw) {
     settings->_edgeWidth = EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"EdgeWidth", 32.0), 10.0, 80.0);
     settings->_regionTop = EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"RegionTop", 0.0), 0.0, 90.0);
     settings->_regionHeight = EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"RegionHeight", 100.0), 10.0, 100.0);
-    settings->_threshold = EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"Threshold", 30.0), 4.0, 150.0);
-    settings->_minimumTravel = EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"MinimumTravel", 8.0), 0.0, 60.0);
+    settings->_threshold = EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"Threshold", 20.0), 4.0, 150.0);
+    settings->_minimumTravel = EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"MinimumTravel", 0.0), 0.0, 60.0);
     settings->_areaAlpha = EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"AreaAlpha", 0.2), 0.0, 1.0);
     settings->_gestureType = (NSUInteger)EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"GestureType", 0.0), 0.0, 31.0);
     settings->_URLString = [EdgeURLReadString(@"URL", @"") copy];

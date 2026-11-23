@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT
 //
-// The gesture side of the tweak: one pan recognizer handed to SpringBoard's
-// window scene through its system gesture manager, so an edge swipe reaches us
-// before the frontmost app sees it, and no window of ours ever takes a touch.
+// The gesture side of the tweak: edge swipe recognizers on SpringBoard's own
+// home screen windows, and the wave drawn as a non-interactive subview of that
+// window. Only SpringBoard is injected, so the gesture belongs to the home
+// screen and never reaches into an app.
 #import <UIKit/UIKit.h>
 
 @interface EdgeURLGestureController : NSObject

@@ -155,7 +155,7 @@
 			<key>PostNotification</key>
 			<string>local.apelin.edgeurl/changed</string>
 			<key>footerText</key>
-			<string>Draws the trigger band while a swipe is in progress. Off hides it whatever Area Opacity is set to.</string>
+			<string>Draws the band while the desktop is showing, so the trigger area can be seen and hit. Off hides it whatever Area Opacity is set to.</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -163,7 +163,7 @@
 			<key>label</key>
 			<string>Area Opacity</string>
 			<key>footerText</key>
-			<string>The slider sets the trigger band's opacity itself: 0 leaves the band invisible, 1 tints it solid white, 0.2 is one fifth strength. The band is drawn only while a swipe is in progress, and only when Show Trigger Area is on.</string>
+			<string>The slider sets the trigger band's opacity itself: 0 leaves the band invisible, 1 tints it solid, 0.2 is one fifth strength. The band sits on the edge and stays visible while the desktop is showing; a swipe in from it draws the wave over it.</string>
 		</dict>
 		<dict>
 			<key>cell</key>
@@ -202,7 +202,7 @@
 			<key>key</key>
 			<string>MinimumTravel</string>
 			<key>default</key>
-			<integer>8</integer>
+			<integer>0</integer>
 			<key>min</key>
 			<integer>0</integer>
 			<key>max</key>
@@ -222,7 +222,7 @@
 			<key>key</key>
 			<string>Threshold</string>
 			<key>default</key>
-			<integer>30</integer>
+			<integer>20</integer>
 			<key>min</key>
 			<integer>4</integer>
 			<key>max</key>

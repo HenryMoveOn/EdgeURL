@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: MIT
 //
-// One pan recognizer, registered with each window scene's system gesture
-// manager in a slot of its own. The manager hands it touches from the whole
-// display before the frontmost app, which is what lets an edge swipe work over
-// another app. All positions are in display coordinates: the screen's
-// coordinate space is 430 x 932 on this device and never rotates with
-// SpringBoard's scene, so the band maths is the same in any orientation.
+// Touch capture, SpringBoard only. The tweak is injected into SpringBoard and
+// nothing else, so the gesture is taken from the windows SpringBoard itself
+// puts under the finger: on the home screen that is its own window, which is
+// also where the trigger band and the wave are drawn. No system gesture
+// manager is asked for anything (its refusals are what ended SpringBoard
+// before), and no window of the tweak's own ever sits above everything: the
+// indicator is a non-interactive subview of the home screen window, so it
+// appears exactly where it makes sense and goes away with the home screen.
+//
+// All hit testing is done in display coordinates, the screen's coordinate
+// space, which does not rotate with the scene.
 #import "EdgeURLGestureController.h"
 
 #import "EdgeURLIndicatorView.h"
-#import "EdgeURLPrivate.h"
+#import "EdgeURLPanRecognizer.h"
 #import "EdgeURLSettings.h"
 
 #import <QuartzCore/QuartzCore.h>
@@ -19,7 +24,11 @@
 #import <stdarg.h>
 #import <unistd.h>
 
-static const CFTimeInterval EdgeURLFadeDuration = 0.12;
+static const CFTimeInterval EdgeURLFadeDuration = 0.22;
+// A touch this many points outside the drawn band still starts the gesture:
+// the band is drawn narrow, and asking for a finger inside it exactly left the
+// gesture missing more often than hitting.
+static const CGFloat EdgeURLBandSlack = 14.0;
 
 // TEMPORARY diagnostic: os_log only answers live listeners, so the same lines
 // also go to a file that survives the gesture.
@@ -76,23 +85,21 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
     return edge == EdgeURLEdgeLeft ? @"left" : @"right";
 }
 
-@interface EdgeURLGestureController () <UIGestureRecognizerDelegate>
+@interface EdgeURLGestureController () <EdgeURLPanRecognizerDelegate>
 
-@property (nonatomic, strong) UIPanGestureRecognizer *recognizer;
-@property (nonatomic, strong) NSHashTable<UIScene *> *attachedScenes;
-@property (nonatomic, strong) UIWindow *overlayWindow;
+@property (nonatomic, strong) NSMutableArray<EdgeURLPanRecognizer *> *recognizers;
 @property (nonatomic, strong) EdgeURLIndicatorView *indicatorView;
+@property (nonatomic, weak) UIWindow *indicatorHost;
 @property (nonatomic, strong) CADisplayLink *fadeLink;
 @property (nonatomic, strong) EdgeURLSettings *settings;
 
-@property (nonatomic, assign) NSUInteger registeredGestureType;
 @property (nonatomic, assign) BOOL started;
-@property (nonatomic, assign) NSUInteger attachAttempts;
+@property (nonatomic, assign) BOOL watchdogStarted;
+@property (nonatomic, assign) BOOL loggedWindows;
 
-@property (nonatomic, assign) EdgeURLEdge pendingEdge;
 @property (nonatomic, assign) EdgeURLEdge activeEdge;
 @property (nonatomic, assign) CGPoint touchDown;
-@property (nonatomic, assign) BOOL touchDownValid;
+@property (nonatomic, assign) CGPoint lastDisplayPoint;
 @property (nonatomic, assign) BOOL active;
 @property (nonatomic, assign) BOOL brightened;
 
@@ -115,8 +122,7 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
 - (instancetype)init {
     self = [super init];
     if (self) {
-        _attachedScenes = [NSHashTable weakObjectsHashTable];
-        _pendingEdge = EdgeURLEdgeLeft;
+        _recognizers = [NSMutableArray array];
         _activeEdge = EdgeURLEdgeLeft;
     }
     return self;
@@ -125,24 +131,29 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
 #pragma mark - Lifecycle
 
 - (void)start {
+    [self currentSettings];
     if (self.started) {
-        [self attachToConnectedScenes];
+        [self reconcile];
         return;
     }
     self.started = YES;
 
     NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
     [center addObserver:self
-               selector:@selector(sceneDidActivate:)
+               selector:@selector(sceneDidChange:)
                    name:UISceneDidActivateNotification
                  object:nil];
     [center addObserver:self
-               selector:@selector(sceneWillConnect:)
+               selector:@selector(sceneDidChange:)
                    name:UISceneWillConnectNotification
                  object:nil];
     [center addObserver:self
-               selector:@selector(sceneDidDisconnect:)
+               selector:@selector(sceneDidChange:)
                    name:UISceneDidDisconnectNotification
+                 object:nil];
+    [center addObserver:self
+               selector:@selector(sceneDidChange:)
+                   name:UIApplicationDidBecomeActiveNotification
                  object:nil];
 
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
@@ -152,41 +163,18 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
                                     NULL,
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
 
-    EdgeURLSettings *settings = [self currentSettings];
-    os_log(EdgeURLGestureLog(), "started %{public}s", settings.summary.UTF8String);
-    EdgeURLDebugLog(@"started %@", settings.summary);
-
-    [self attachToConnectedScenes];
-
-    // The scene may connect a moment after we load; the notification above
-    // covers that, and the retry below covers a scene that was already there
-    // and a manager that refuses the recognizer early in the launch.
-    [self scheduleAttachAttempt];
+    os_log(EdgeURLGestureLog(), "started %{public}s", self.settings.summary.UTF8String);
+    EdgeURLDebugLog(@"started %@", self.settings.summary);
+    [self reconcile];
+    [self startWatchdog];
 }
 
-// Keeps asking for a scene until one takes the recognizer, for the first couple
-// of minutes of the process's life: on this springboard the scene arrives well
-// after the launch callbacks, and one attempt at load time was not enough.
-- (void)scheduleAttachAttempt {
-    if (self.attachedScenes.count > 0) {
-        return;
-    }
-    if (self.attachAttempts >= 40) {
-        os_log(EdgeURLGestureLog(), "giving up: no scene took the recognizer after %lu attempts",
-               (unsigned long)self.attachAttempts);
-        return;
-    }
-    self.attachAttempts += 1;
-    [self attachToConnectedScenes];
-    if (self.attachedScenes.count > 0) {
-        os_log(EdgeURLGestureLog(), "attached after %lu attempt(s)", (unsigned long)self.attachAttempts);
-        return;
-    }
-    __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [weakSelf scheduleAttachAttempt];
-    });
+- (void)dealloc {
+    CFNotificationCenterRemoveObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                       (__bridge const void *)self,
+                                       (__bridge CFStringRef)EdgeURLChangedNotification(),
+                                       NULL);
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 
 static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
@@ -204,12 +192,34 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
     });
 }
 
-- (void)dealloc {
-    CFNotificationCenterRemoveObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                       (__bridge const void *)self,
-                                       (__bridge CFStringRef)EdgeURLChangedNotification(),
-                                       NULL);
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
+// The home screen window is there from early in the launch, but SpringBoard
+// builds and rebuilds its scene, so the attachment is re-checked every couple
+// of seconds; it costs one array copy and changes nothing when all is well.
+- (void)startWatchdog {
+    if (self.watchdogStarted) {
+        return;
+    }
+    self.watchdogStarted = YES;
+    [self scheduleWatchdogTick];
+}
+
+// Each tick schedules the next one itself: going back through -startWatchdog
+// stopped after the first tick, because that method refuses a watchdog it has
+// already started, and the gesture then never came back after the home screen
+// had been hidden once.
+- (void)scheduleWatchdogTick {
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf watchdogTick];
+    });
+}
+
+- (void)watchdogTick {
+    if (!self.active) {
+        [self reconcile];
+    }
+    [self scheduleWatchdogTick];
 }
 
 #pragma mark - Settings
@@ -217,196 +227,238 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
 - (EdgeURLSettings *)currentSettings {
     if (self.settings == nil) {
         self.settings = [EdgeURLSettings currentSettings];
-        self.registeredGestureType = self.settings.gestureType;
     }
     return self.settings;
 }
 
 - (void)preferencesChanged {
-    EdgeURLSettings *settings = [EdgeURLSettings currentSettings];
-    BOOL typeChanged = (settings.gestureType != self.registeredGestureType);
-    self.settings = settings;
-    os_log(EdgeURLGestureLog(), "preferences reloaded %{public}s", settings.summary.UTF8String);
-    EdgeURLDebugLog(@"prefs changed %@", settings.summary);
-    if (!settings.enabled && self.active) {
+    self.settings = [EdgeURLSettings currentSettings];
+    os_log(EdgeURLGestureLog(), "preferences reloaded %{public}s", self.settings.summary.UTF8String);
+    EdgeURLDebugLog(@"prefs changed %@", self.settings.summary);
+    if (!self.settings.enabled && self.active) {
         [self finishWithProgress:self.indicatorView.progress opens:NO];
     }
-    if (typeChanged) {
-        self.registeredGestureType = settings.gestureType;
-        [self reattach];
-    }
-    if (self.attachedScenes.count == 0) {
-        [self attachToConnectedScenes];
-    }
+    [self reconcile];
     // The trigger area stays on screen: its edges, region, width and opacity
-    // are read straight from the settings, so every move of a slider shows at
-    // once and a wrong region or a faint band is visible without a swipe.
+    // come straight from the settings, so a moved slider shows at once.
     [self updateTriggerAreas];
 }
 
-#pragma mark - Scene attachment
+#pragma mark - Attachment
 
-// SpringBoard keeps more window scenes than its own: the System Aperture one
-// (the Dynamic Island), banner and service scenes. They are UIWindowScenes, yet
-// some do not answer -systemGestureManager at all, and a message sent there
-// raises an unrecognized selector that ends the process. So every scene is
-// judged first and only the main display scene, which owns the screen's
-// gesture manager, may take the recognizer. Nothing is sent to a scene that
-// has not answered respondsToSelector: for the exact selector.
-static BOOL EdgeURLSceneNameIsAuxiliary(NSString *className) {
+// The scene that owns the display: the only one whose windows can be under the
+// finger on the home screen. SpringBoard has several window scenes on the main
+// screen — the System Aperture (Dynamic Island) one among them — and its own is
+// the plain SBWindowScene; the auxiliary ones must be skipped, or the aperture
+// window is the only one found and it never sees a touch on the home screen.
+static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     return [className containsString:@"Aperture"] ||
            [className containsString:@"Banner"] ||
+           [className containsString:@"Curtain"] ||
            [className containsString:@"Service"] ||
-           [className containsString:@"StatusBar"];
+           [className containsString:@"StatusBar"] ||
+           [className containsString:@"Keyboard"];
 }
 
-static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
-    return [className containsString:@"MainDisplayWindowScene"] ||
-           [className containsString:@"SBWindowScene"];
-}
-
-// The manager of a scene that may have one, or nil. Every check comes before
-// the message it guards.
-- (UISystemGestureManager *)gestureManagerForScene:(UIWindowScene *)scene {
-    if (scene == nil || ![scene isKindOfClass:[UIWindowScene class]]) {
-        return nil;
-    }
-    NSString *className = NSStringFromClass([scene class]);
-    if (EdgeURLSceneNameIsAuxiliary(className)) {
-        return nil;
-    }
-    if (![scene respondsToSelector:@selector(systemGestureManager)]) {
-        return nil;
-    }
-    UISystemGestureManager *manager = [scene systemGestureManager];
-    if (manager == nil || ![manager respondsToSelector:@selector(addGestureRecognizer:withType:)]) {
-        return nil;
-    }
-    return manager;
-}
-
-// The scenes that own a system gesture manager and could take the recognizer,
-// the main display scene first.
-- (NSArray<UIWindowScene *> *)eligibleScenes {
-    NSMutableArray<UIWindowScene *> *preferred = [NSMutableArray array];
-    NSMutableArray<UIWindowScene *> *rest = [NSMutableArray array];
+- (UIWindowScene *)mainScene {
+    UIWindowScene *fallback = nil;
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]] ||
+            scene.activationState == UISceneActivationStateUnattached) {
+            continue;
+        }
+        NSString *className = NSStringFromClass([scene class]);
+        if (EdgeURLSceneIsAuxiliary(className)) {
+            continue;
+        }
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        if (windowScene.screen == [UIScreen mainScreen]) {
+            return windowScene;
+        }
+        if (fallback == nil) {
+            fallback = windowScene;
+        }
+    }
+    return fallback;
+}
+
+// Windows that are never the home screen's own surface, even when they happen
+// to be on screen: the keyboard, an alert, the recording dot, screenshot
+// chrome. A recognizer there would see touches the gesture has no business in.
+static BOOL EdgeURLWindowIsNoise(NSString *className) {
+    return [className containsString:@"Keyboard"] ||
+           [className containsString:@"AlertItem"] ||
+           [className containsString:@"RecordingIndicator"] ||
+           [className containsString:@"Screenshots"] ||
+           [className containsString:@"TextEffects"] ||
+           [className containsString:@"ReusePool"];
+}
+
+// Every visible, screen-sized window of the scene, at any level. Which window
+// takes a touch is SpringBoard's business — other tweaks keep full-screen
+// windows far above the normal level, and one of those can be the window under
+// the finger — so the recognizer goes on all of them. It never cancels touches
+// in the view it watches, and it lets every other recognizer recognise beside
+// it, so sitting there changes nothing about how the screen behaves.
+- (NSArray<UIWindow *> *)candidateWindowsForScene:(UIWindowScene *)scene {
+    CGRect screen = [UIScreen mainScreen].bounds;
+    NSMutableArray<UIWindow *> *windows = [NSMutableArray array];
+    for (UIWindow *window in scene.windows) {
+        if (window.hidden || window.alpha < 0.01) {
+            continue;
+        }
+        if (EdgeURLWindowIsNoise(NSStringFromClass([window class]))) {
+            continue;
+        }
+        CGRect bounds = window.bounds;
+        if (CGRectGetWidth(bounds) < CGRectGetWidth(screen) * 0.9 ||
+            CGRectGetHeight(bounds) < CGRectGetHeight(screen) * 0.9) {
+            continue;
+        }
+        [windows addObject:window];
+    }
+    return windows;
+}
+
+// Where the band and the wave are drawn: the home screen's own window, which is
+// shown exactly while the desktop is, and never an overlay of another tweak.
+- (UIWindow *)indicatorHostForWindows:(NSArray<UIWindow *> *)windows {
+    UIWindow *lowest = nil;
+    for (UIWindow *window in windows) {
+        if ([NSStringFromClass([window class]) containsString:@"HomeScreen"]) {
+            return window;
+        }
+        if (lowest == nil || window.windowLevel < lowest.windowLevel) {
+            lowest = window;
+        }
+    }
+    return lowest;
+}
+
+- (EdgeURLPanRecognizer *)recognizerOnWindow:(UIWindow *)window {
+    for (EdgeURLPanRecognizer *recognizer in self.recognizers) {
+        if (recognizer.view == window) {
+            return recognizer;
+        }
+    }
+    return nil;
+}
+
+// TEMPORARY diagnostic: every window SpringBoard has, without any filter, so
+// the one that takes the home screen's touches can be named.
+- (void)logWindowInventory {
+    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+        EdgeURLDebugLog(@"scene %@ state=%ld",
+                        NSStringFromClass([scene class]), (long)scene.activationState);
         if (![scene isKindOfClass:[UIWindowScene class]]) {
             continue;
         }
         UIWindowScene *windowScene = (UIWindowScene *)scene;
-        if (windowScene.activationState == UISceneActivationStateUnattached) {
-            continue;
+        UIWindow *key = nil;
+        @try {
+            key = windowScene.keyWindow;
+        } @catch (NSException *exception) {
+            key = nil;
         }
-        if ([self gestureManagerForScene:windowScene] == nil) {
-            EdgeURLDebugLog(@"no manager for %@", NSStringFromClass([scene class]));
-            continue;
-        }
-        if (EdgeURLSceneNameIsMainDisplay(NSStringFromClass([scene class]))) {
-            [preferred addObject:windowScene];
-        } else {
-            [rest addObject:windowScene];
+        EdgeURLDebugLog(@"  key window: %@", key != nil
+                        ? [NSString stringWithFormat:@"%@ level=%.1f frame=%@",
+                           NSStringFromClass([key class]), key.windowLevel,
+                           NSStringFromCGRect(key.frame)]
+                        : @"(none)");
+        for (UIWindow *window in windowScene.windows) {
+            EdgeURLDebugLog(@"  win %@ level=%.1f hidden=%d alpha=%.2f frame=%@",
+                            NSStringFromClass([window class]), window.windowLevel,
+                            window.hidden, window.alpha, NSStringFromCGRect(window.frame));
         }
     }
-    return [preferred arrayByAddingObjectsFromArray:rest];
+    for (UIWindow *window in [UIApplication sharedApplication].windows) {
+        EdgeURLDebugLog(@"  app win %@ level=%.1f hidden=%d alpha=%.2f frame=%@",
+                        NSStringFromClass([window class]), window.windowLevel,
+                        window.hidden, window.alpha, NSStringFromCGRect(window.frame));
+    }
 }
 
-// One manager is enough, and more than one is not allowed: the same recognizer
-// handed to a second manager is refused, and the manager raises an exception
-// rather than answering NO, which would end SpringBoard. So the first scene
-// that takes it wins, and the managers report every touch on the display.
-- (void)attachToConnectedScenes {
-    NSArray<UIWindowScene *> *scenes = [self eligibleScenes];
-    os_log(EdgeURLGestureLog(), "attach attempt %lu: %lu eligible scene(s)",
-           (unsigned long)self.attachAttempts, (unsigned long)scenes.count);
-    if (self.attachedScenes.count > 0) {
+- (void)reconcile {
+    UIWindowScene *scene = [self mainScene];
+    if (scene == nil) {
+        EdgeURLDebugLog(@"no window scene yet");
         return;
     }
-    for (UIWindowScene *scene in scenes) {
-        if ([self attachToScene:scene]) {
-            break;
+    NSArray<UIWindow *> *windows = [self candidateWindowsForScene:scene];
+
+    EdgeURLDebugLog(@"reconcile scene=%@ candidates=%lu",
+                    NSStringFromClass([scene class]), (unsigned long)windows.count);
+
+    if (!self.loggedWindows) {
+        self.loggedWindows = YES;
+        [self logWindowInventory];
+        for (UIWindow *window in windows) {
+            EdgeURLDebugLog(@"window %@ level=%.1f hidden=%d frame=%@",
+                            NSStringFromClass([window class]), window.windowLevel,
+                            window.hidden, NSStringFromCGRect(window.frame));
+            os_log(EdgeURLGestureLog(), "window %{public}@ level=%.1f frame=%{public}s",
+                   NSStringFromClass([window class]), window.windowLevel,
+                   NSStringFromCGRect(window.frame).UTF8String);
         }
     }
-    [self updateTriggerAreas];
-}
 
-- (UIPanGestureRecognizer *)makeRecognizerIfNeeded {
-    if (self.recognizer == nil) {
-        UIPanGestureRecognizer *recognizer =
-            [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-        recognizer.delegate = self;
-        recognizer.maximumNumberOfTouches = 1;
-        recognizer.cancelsTouchesInView = NO;
-        recognizer.delaysTouchesEnded = NO;
-        self.recognizer = recognizer;
-    }
-    return self.recognizer;
-}
-
-- (BOOL)attachToScene:(UIWindowScene *)scene {
-    if (scene == nil || [self.attachedScenes containsObject:scene]) {
-        return NO;
-    }
-    UISystemGestureManager *manager = [self gestureManagerForScene:scene];
-    if (manager == nil) {
-        return NO;
-    }
-    UIPanGestureRecognizer *recognizer = [self makeRecognizerIfNeeded];
-    NSUInteger type = [self currentSettings].gestureType;
-    @try {
-        [manager addGestureRecognizer:recognizer withType:type];
-    } @catch (NSException *exception) {
-        // The refusal carries the one thing worth knowing about the slot: the
-        // manager's own reason.
-        os_log(EdgeURLGestureLog(), "refused %{public}@ type=%lu: %{public}@",
-               NSStringFromClass([scene class]), (unsigned long)type, exception.reason);
-        EdgeURLDebugLog(@"refused %@ type=%lu: %@", NSStringFromClass([scene class]),
-                        (unsigned long)type, exception.reason);
-        return NO;
-    }
-    [self.attachedScenes addObject:scene];
-    EdgeURLDebugLog(@"attached %@ type=%lu display=%@",
-                    NSStringFromClass([scene class]), (unsigned long)type,
-                    NSStringFromCGRect([UIScreen mainScreen].coordinateSpace.bounds));
-    os_log(EdgeURLGestureLog(),
-           "attached scene %{public}@ type=%lu display=%{public}@",
-           NSStringFromClass([scene class]), (unsigned long)type,
-           NSStringFromCGRect([UIScreen mainScreen].coordinateSpace.bounds));
-    return YES;
-}
-
-- (void)reattach {
-    NSArray<UIScene *> *scenes = self.attachedScenes.allObjects;
-    for (UIScene *scene in scenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) {
+    for (EdgeURLPanRecognizer *recognizer in [self.recognizers copy]) {
+        UIView *view = recognizer.view;
+        BOOL stillCandidate = NO;
+        for (UIWindow *window in windows) {
+            if ((UIView *)window == view) {
+                stillCandidate = YES;
+                break;
+            }
+        }
+        if (view != nil && stillCandidate) {
             continue;
         }
-        UISystemGestureManager *manager = [self gestureManagerForScene:(UIWindowScene *)scene];
-        if ([manager respondsToSelector:@selector(removeGestureRecognizer:)]) {
-            [manager removeGestureRecognizer:self.recognizer];
+        if (view != nil) {
+            [view removeGestureRecognizer:recognizer];
         }
-        [self.attachedScenes removeObject:scene];
+        [self.recognizers removeObject:recognizer];
+        EdgeURLDebugLog(@"recognizer detached from %@",
+                        view != nil ? NSStringFromClass([view class]) : @"(nil)");
     }
-    os_log(EdgeURLGestureLog(), "re-attaching with type=%lu", (unsigned long)self.registeredGestureType);
-    [self attachToConnectedScenes];
+
+    for (UIWindow *window in windows) {
+        if ([self recognizerOnWindow:window] != nil) {
+            continue;
+        }
+        EdgeURLPanRecognizer *recognizer =
+            [[EdgeURLPanRecognizer alloc] initWithTarget:self action:@selector(handleEdgePan:)];
+        recognizer.edgeDelegate = self;
+        [window addGestureRecognizer:recognizer];
+        [self.recognizers addObject:recognizer];
+        EdgeURLDebugLog(@"recognizer attached to %@ level=%.1f",
+                        NSStringFromClass([window class]), window.windowLevel);
+        os_log(EdgeURLGestureLog(), "attached to %{public}@ level=%.1f",
+               NSStringFromClass([window class]), window.windowLevel);
+    }
+
+    // The band and the wave live in the home screen's window; the recognizers
+    // sit on every full-screen window of the scene, so whichever one takes the
+    // touch, the gesture is seen.
+    UIWindow *host = [self indicatorHostForWindows:windows];
+    if (host != nil && (host != self.indicatorHost ||
+                        self.indicatorView.superview != host)) {
+        [self.indicatorView removeFromSuperview];
+        self.indicatorHost = host;
+        self.indicatorView.frame = host.bounds;
+        self.indicatorView.autoresizingMask =
+            UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        [host addSubview:self.indicatorView];
+        EdgeURLDebugLog(@"indicator hosted in %@ bounds=%@",
+                        NSStringFromClass([host class]), NSStringFromCGRect(host.bounds));
+        [self updateTriggerAreas];
+    } else if (host != nil) {
+        self.indicatorView.frame = host.bounds;
+    }
 }
 
-- (void)sceneDidActivate:(NSNotification *)notification {
-    id scene = notification.object;
-    if ([scene isKindOfClass:[UIWindowScene class]]) {
-        [self attachToScene:(UIWindowScene *)scene];
-    }
-}
-
-- (void)sceneWillConnect:(NSNotification *)notification {
-    [self sceneDidActivate:notification];
-}
-
-- (void)sceneDidDisconnect:(NSNotification *)notification {
-    id scene = notification.object;
-    if ([scene isKindOfClass:[UIScene class]]) {
-        [self.attachedScenes removeObject:(UIScene *)scene];
-    }
+- (void)sceneDidChange:(NSNotification *)notification {
+    [self reconcile];
 }
 
 #pragma mark - Geometry
@@ -415,58 +467,27 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
     return [UIScreen mainScreen].coordinateSpace.bounds;
 }
 
-- (UIWindowScene *)activeScene {
-    UIWindowScene *eligible = nil;
-    for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]] ||
-            scene.activationState == UISceneActivationStateUnattached) {
-            continue;
-        }
-        UIWindowScene *windowScene = (UIWindowScene *)scene;
-        if ([self gestureManagerForScene:windowScene] == nil) {
-            continue;
-        }
-        if (EdgeURLSceneNameIsMainDisplay(NSStringFromClass([scene class]))) {
-            return windowScene;
-        }
-        if (eligible == nil) {
-            eligible = windowScene;
-        }
+- (CGPoint)displayPointForViewPoint:(CGPoint)point inView:(UIView *)view {
+    if (view == nil) {
+        return point;
     }
-    return eligible;
+    return [view convertPoint:point toCoordinateSpace:[UIScreen mainScreen].coordinateSpace];
 }
 
-// A recognizer the system gesture manager owns has no view, so the touch
-// arrives in window coordinates; one with a view converts through it.
-- (CGPoint)displayPointForGesture:(UIGestureRecognizer *)recognizer {
+- (CGPoint)displayPointForRecognizer:(EdgeURLPanRecognizer *)recognizer {
     UIView *view = recognizer.view;
-    UIView *window = view.window ?: view;
-    if (window != nil) {
-        CGPoint point = [recognizer locationInView:window];
-        return [window convertPoint:point toCoordinateSpace:[UIScreen mainScreen].coordinateSpace];
+    if (view == nil) {
+        return [recognizer locationInView:nil];
     }
-    return [recognizer locationInView:nil];
+    return [self displayPointForViewPoint:[recognizer locationInView:view] inView:view];
 }
 
-- (CGPoint)displayPointForTouch:(UITouch *)touch {
-    UIView *window = touch.window;
-    if (window != nil) {
-        CGPoint point = [touch locationInView:window];
-        return [window convertPoint:point toCoordinateSpace:[UIScreen mainScreen].coordinateSpace];
+- (CGPoint)viewPointForDisplayPoint:(CGPoint)point {
+    UIView *host = self.indicatorView.superview;
+    if (host == nil) {
+        return point;
     }
-    return [touch locationInView:nil];
-}
-
-- (CGPoint)displayTranslationForGesture:(UIPanGestureRecognizer *)recognizer {
-    UIView *view = recognizer.view;
-    if (view != nil) {
-        CGPoint translation = [recognizer translationInView:view];
-        CGFloat scaleX = view.window != nil ? view.window.transform.a : 1.0;
-        CGFloat scaleY = view.window != nil ? view.window.transform.d : 1.0;
-        return CGPointMake(translation.x * (scaleX != 0.0 ? scaleX : 1.0),
-                           translation.y * (scaleY != 0.0 ? scaleY : 1.0));
-    }
-    return [recognizer translationInView:nil];
+    return [host convertPoint:point fromCoordinateSpace:[UIScreen mainScreen].coordinateSpace];
 }
 
 - (BOOL)displayPoint:(CGPoint)point isInBandWithSettings:(EdgeURLSettings *)settings edge:(EdgeURLEdge *)edge {
@@ -476,11 +497,12 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
     if (width < 2.0 || height < 2.0) {
         return NO;
     }
-    BOOL leftSide = NO;
-    if (point.x <= settings.edgeWidth && settings.leftEdge) {
-        leftSide = YES;
-    } else if (point.x >= width - settings.edgeWidth && settings.rightEdge) {
-        leftSide = NO;
+    CGFloat band = settings.edgeWidth + EdgeURLBandSlack;
+    BOOL onLeft = NO;
+    if (settings.leftEdge && point.x <= band) {
+        onLeft = YES;
+    } else if (settings.rightEdge && point.x >= width - band) {
+        onLeft = NO;
     } else {
         return NO;
     }
@@ -490,7 +512,7 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
         return NO;
     }
     if (edge != NULL) {
-        *edge = leftSide ? EdgeURLEdgeLeft : EdgeURLEdgeRight;
+        *edge = onLeft ? EdgeURLEdgeLeft : EdgeURLEdgeRight;
     }
     return YES;
 }
@@ -503,104 +525,76 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
     return MAX(0.0, travel);
 }
 
-#pragma mark - UIGestureRecognizerDelegate
+#pragma mark - EdgeURLPanRecognizerDelegate
 
-- (BOOL)gestureRecognizer:(UIGestureRecognizer *)recognizer shouldReceiveTouch:(UITouch *)touch {
-    if (recognizer != self.recognizer) {
-        return YES;
-    }
-    // Record the touch-down point before any drift, which is what the band
-    // test wants. Every touch is accepted here; gestureRecognizerShouldBegin:
-    // is the one and only gate, so a touch outside the band is left alone.
-    CGPoint point = [self displayPointForTouch:touch];
-    self.touchDown = point;
-    self.touchDownValid = YES;
-    EdgeURLDebugLog(@"touch down (%.1f,%.1f)", point.x, point.y);
-
-    EdgeURLSettings *settings = [self currentSettings];
-    EdgeURLEdge edge = EdgeURLEdgeLeft;
-    if (settings.enabled && [self displayPoint:point isInBandWithSettings:settings edge:&edge]) {
-        self.pendingEdge = edge;
-    }
-    return YES;
-}
-
-- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)recognizer {
-    if (recognizer != self.recognizer) {
-        return YES;
-    }
+- (BOOL)panRecognizer:(EdgeURLPanRecognizer *)recognizer
+    wantsTouchDownAtPointInView:(CGPoint)point
+                          edge:(EdgeURLEdge *)edge {
     EdgeURLSettings *settings = [self currentSettings];
     if (!settings.enabled || settings.URL == nil) {
         return NO;
     }
-
-    // The touch-down point again, this time derived from the location and the
-    // translation, in case shouldReceiveTouch was never asked.
-    CGPoint location = [self displayPointForGesture:recognizer];
-    CGPoint translation = [self displayTranslationForGesture:(UIPanGestureRecognizer *)recognizer];
-    CGPoint derived = CGPointMake(location.x - translation.x, location.y - translation.y);
-    if (!self.touchDownValid) {
-        self.touchDown = derived;
-    }
-
-    EdgeURLEdge edge = EdgeURLEdgeLeft;
-    if (![self displayPoint:self.touchDown isInBandWithSettings:settings edge:&edge]) {
-        os_log(EdgeURLGestureLog(),
-               "not in band down=(%.1f,%.1f) derived=(%.1f,%.1f) display=%{public}@",
-               self.touchDown.x, self.touchDown.y, derived.x, derived.y,
-               NSStringFromCGRect([self displayBounds]));
-        EdgeURLDebugLog(@"shouldBegin NO: down (%.1f,%.1f) derived (%.1f,%.1f) display %@",
-                        self.touchDown.x, self.touchDown.y, derived.x, derived.y,
-                        NSStringFromCGRect([self displayBounds]));
+    CGPoint display = [self displayPointForViewPoint:point inView:recognizer.view];
+    EdgeURLEdge found = EdgeURLEdgeLeft;
+    if (![self displayPoint:display isInBandWithSettings:settings edge:&found]) {
         return NO;
     }
-    self.pendingEdge = edge;
-    EdgeURLDebugLog(@"shouldBegin YES edge=%d down (%.1f,%.1f)",
-                    (int)edge, self.touchDown.x, self.touchDown.y);
-    os_log(EdgeURLGestureLog(),
-           "should begin edge=%{public}s down=(%.1f,%.1f) derived=(%.1f,%.1f) display=%{public}@ band=%.1f",
-           EdgeURLGestureName(edge).UTF8String,
-           self.touchDown.x, self.touchDown.y, derived.x, derived.y,
-           NSStringFromCGRect([self displayBounds]), settings.edgeWidth);
+    if (edge != NULL) {
+        *edge = found;
+    }
+    EdgeURLDebugLog(@"touch down (%.1f,%.1f) edge=%d window=%@",
+                    display.x, display.y, (int)found,
+                    NSStringFromClass([recognizer.view class]));
     return YES;
 }
 
-#pragma mark - Pan
+#pragma mark - Swipe
 
-- (void)handlePan:(UIPanGestureRecognizer *)recognizer {
+- (void)handleEdgePan:(EdgeURLPanRecognizer *)recognizer {
     switch (recognizer.state) {
         case UIGestureRecognizerStateBegan:
-            [self beginWithPan:recognizer];
+            [self beginEdgePan:recognizer];
             break;
         case UIGestureRecognizerStateChanged:
-            [self updateWithPan:recognizer];
+            [self updateEdgePan:recognizer];
             break;
         case UIGestureRecognizerStateEnded:
-            [self endWithPan:recognizer cancelled:NO];
+            [self endEdgePan:recognizer cancelled:NO];
             break;
         case UIGestureRecognizerStateCancelled:
         case UIGestureRecognizerStateFailed:
-            [self endWithPan:recognizer cancelled:YES];
+            [self endEdgePan:recognizer cancelled:YES];
             break;
         default:
             break;
     }
 }
 
-- (void)beginWithPan:(UIPanGestureRecognizer *)recognizer {
+- (void)beginEdgePan:(EdgeURLPanRecognizer *)recognizer {
     EdgeURLSettings *settings = [self currentSettings];
-    self.activeEdge = self.pendingEdge;
+    self.activeEdge = recognizer.trackedEdge;
+    self.touchDown = [self displayPointForViewPoint:recognizer.startPoint
+                                             inView:recognizer.view];
     self.active = YES;
     self.brightened = NO;
-    self.touchDownValid = NO;
     [self stopFade];
 
-    [self showOverlayWithSettings:settings];
-    [self updateWithPan:recognizer];
+    if ([self prepareIndicatorWithSettings:settings]) {
+        EdgeURLIndicatorView *view = self.indicatorView;
+        view.previewMode = NO;
+        view.edge = self.activeEdge;
+        view.progress = 0.0;
+        view.alpha = 1.0;
+        [view setNeedsDisplay];
+    }
+    [self updateEdgePan:recognizer];
 
     os_log(EdgeURLGestureLog(), "tracking edge=%{public}s down=(%.1f,%.1f)",
-           EdgeURLGestureName(self.activeEdge).UTF8String, self.touchDown.x, self.touchDown.y);
-    EdgeURLDebugLog(@"tracking edge=%d", (int)self.activeEdge);
+           EdgeURLGestureName(self.activeEdge).UTF8String,
+           self.touchDown.x, self.touchDown.y);
+    EdgeURLDebugLog(@"tracking edge=%d down=(%.1f,%.1f) window=%@",
+                    (int)self.activeEdge, self.touchDown.x, self.touchDown.y,
+                    NSStringFromClass([recognizer.view class]));
 }
 
 - (CGFloat)progressForTravel:(CGFloat)travel settings:(EdgeURLSettings *)settings {
@@ -608,17 +602,18 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
     return MIN(1.0, MAX(0.0, travel / threshold));
 }
 
-- (void)updateWithPan:(UIPanGestureRecognizer *)recognizer {
+- (void)updateEdgePan:(EdgeURLPanRecognizer *)recognizer {
     if (!self.active) {
         return;
     }
     EdgeURLSettings *settings = [self currentSettings];
-    CGPoint location = [self displayPointForGesture:recognizer];
-    CGFloat travel = [self travelForPoint:location edge:self.activeEdge];
+    CGPoint display = [self displayPointForRecognizer:recognizer];
+    self.lastDisplayPoint = display;
+    CGFloat travel = [self travelForPoint:display edge:self.activeEdge];
     CGFloat progress = [self progressForTravel:travel settings:settings];
 
     EdgeURLIndicatorView *view = self.indicatorView;
-    view.touchY = location.y;
+    view.touchY = [self viewPointForDisplayPoint:display].y;
     view.progress = progress;
     [view setNeedsDisplay];
 
@@ -634,15 +629,19 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
     }
 }
 
-- (void)endWithPan:(UIPanGestureRecognizer *)recognizer cancelled:(BOOL)cancelled {
+- (void)endEdgePan:(EdgeURLPanRecognizer *)recognizer cancelled:(BOOL)cancelled {
     if (!self.active) {
         return;
     }
     EdgeURLSettings *settings = [self currentSettings];
-    CGPoint location = [self displayPointForGesture:recognizer];
-    CGFloat travel = [self travelForPoint:location edge:self.activeEdge];
+    CGPoint display = [self displayPointForRecognizer:recognizer];
+    if (!CGPointEqualToPoint(display, CGPointZero)) {
+        self.lastDisplayPoint = display;
+    }
+    CGFloat travel = [self travelForPoint:self.lastDisplayPoint edge:self.activeEdge];
     CGFloat progress = [self progressForTravel:travel settings:settings];
-    BOOL opens = (!cancelled && travel >= settings.minimumTravel && settings.URL != nil);
+    BOOL opens = (!cancelled && travel >= settings.minimumTravel &&
+                  settings.enabled && settings.URL != nil);
 
     os_log(EdgeURLGestureLog(),
            "end edge=%{public}s travel=%.1f minTravel=%.1f cancelled=%d opens=%d",
@@ -656,9 +655,15 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
 - (void)finishWithProgress:(CGFloat)progress opens:(BOOL)opens {
     EdgeURLSettings *settings = [self currentSettings];
     self.active = NO;
-    [self fadeOutFromProgress:MAX(EdgeURLFraction(progress), 0.25)];
+    [self recedeFromProgress:MAX(EdgeURLFraction(progress), 0.25)];
     if (opens) {
-        [self openURL:settings.URL];
+        // The wave recedes first: opening straight away would hide the home
+        // screen, and the animation with it, before it had been seen.
+        NSURL *url = settings.URL;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.18 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [self openURL:url];
+        });
     }
 }
 
@@ -669,6 +674,7 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
         return;
     }
     os_log(EdgeURLOpenLog(), "opening %{public}s", url.absoluteString.UTF8String);
+    EdgeURLDebugLog(@"opening %@", url.absoluteString);
     dispatch_async(dispatch_get_main_queue(), ^{
         UIApplication *application = [UIApplication sharedApplication];
         [application openURL:url
@@ -680,60 +686,31 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
     });
 }
 
-#pragma mark - Overlay
+#pragma mark - Indicator
 
 - (EdgeURLIndicatorView *)indicatorView {
     if (_indicatorView == nil) {
         _indicatorView = [[EdgeURLIndicatorView alloc] initWithFrame:[self displayBounds]];
+        _indicatorView.userInteractionEnabled = NO;
     }
     return _indicatorView;
 }
 
-- (void)showOverlayWithSettings:(EdgeURLSettings *)settings {
-    if (![self prepareOverlayWithSettings:settings]) {
-        return;
-    }
-    EdgeURLIndicatorView *view = self.indicatorView;
-    view.previewMode = NO;
-    view.edge = self.activeEdge;
-    view.progress = 0.0;
-    view.alpha = 1.0;
-    self.overlayWindow.hidden = NO;
-    [view setNeedsDisplay];
-    os_log(EdgeURLAnimationLog(), "overlay shown display=%{public}@ edge=%{public}s style=%{public}s",
-           NSStringFromCGRect([self displayBounds]), EdgeURLGestureName(self.activeEdge).UTF8String,
-           settings.animated ? "wave" : "triangle");
-}
-
-// The overlay window, and the view holding the settings' geometry. Answers NO
-// when there is nowhere to draw: no scene, or a display of no size.
-- (BOOL)prepareOverlayWithSettings:(EdgeURLSettings *)settings {
-    CGRect display = [self displayBounds];
-    if (CGRectGetWidth(display) < 2.0 || CGRectGetHeight(display) < 2.0) {
-        EdgeURLDebugLog(@"no display for the overlay: %@", NSStringFromCGRect(display));
+// The view is hosted in the home screen window, so it lives exactly as long as
+// that screen is on show. Geometry comes from the settings, once.
+- (BOOL)prepareIndicatorWithSettings:(EdgeURLSettings *)settings {
+    UIView *host = self.indicatorView.superview;
+    if (host == nil) {
         return NO;
     }
-    if (self.overlayWindow == nil) {
-        UIWindowScene *scene = [self activeScene];
-        if (scene == nil) {
-            os_log(EdgeURLAnimationLog(), "no scene for the overlay");
-            return NO;
-        }
-        UIWindow *window = [[UIWindow alloc] initWithWindowScene:scene];
-        window.backgroundColor = [UIColor clearColor];
-        window.windowLevel = UIWindowLevelAlert + 1;
-        // Nothing in the overlay ever takes a touch.
-        window.userInteractionEnabled = NO;
-        UIViewController *host = [[UIViewController alloc] init];
-        host.view = self.indicatorView;
-        window.rootViewController = host;
-        window.hidden = YES;
-        self.overlayWindow = window;
+    CGRect bounds = host.bounds;
+    if (CGRectGetWidth(bounds) < 2.0 || CGRectGetHeight(bounds) < 2.0) {
+        return NO;
     }
-    self.overlayWindow.frame = display;
-
+    if (!CGRectEqualToRect(self.indicatorView.frame, bounds)) {
+        self.indicatorView.frame = bounds;
+    }
     EdgeURLIndicatorView *view = self.indicatorView;
-    view.frame = self.overlayWindow.bounds;
     view.bandWidth = settings.edgeWidth;
     view.regionTop = settings.regionTop;
     view.regionHeight = settings.regionHeight;
@@ -750,13 +727,7 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
 // cannot disagree about where the edge is.
 - (void)updateTriggerAreas {
     EdgeURLSettings *settings = [self currentSettings];
-    BOOL wanted = settings.enabled && settings.showArea && settings.areaAlpha > 0.001 &&
-                  (settings.leftEdge || settings.rightEdge);
-    if (!wanted) {
-        [self hideTriggerAreas];
-        return;
-    }
-    if (![self prepareOverlayWithSettings:settings]) {
+    if (![self prepareIndicatorWithSettings:settings]) {
         return;
     }
     if (self.active) {
@@ -768,55 +739,48 @@ static BOOL EdgeURLSceneNameIsMainDisplay(NSString *className) {
     view.edge = settings.leftEdge ? EdgeURLEdgeLeft : EdgeURLEdgeRight;
     view.progress = 0.0;
     view.alpha = 1.0;
-    self.overlayWindow.hidden = NO;
     [view setNeedsDisplay];
 
-    os_log(EdgeURLAnimationLog(), "trigger areas shown left=%d right=%d alpha=%.2f width=%.1f top=%.1f height=%.1f",
+    os_log(EdgeURLAnimationLog(),
+           "trigger areas shown left=%d right=%d alpha=%.2f width=%.1f top=%.1f height=%.1f",
            settings.leftEdge, settings.rightEdge, settings.areaAlpha,
            settings.edgeWidth, settings.regionTop, settings.regionHeight);
-    EdgeURLDebugLog(@"band shown left=%d right=%d alpha=%.2f window=%@ hidden=%d alpha=%.2f view=%@",
+    EdgeURLDebugLog(@"band shown left=%d right=%d alpha=%.2f host=%@",
                     settings.leftEdge, settings.rightEdge, settings.areaAlpha,
-                    self.overlayWindow, self.overlayWindow.hidden, view.alpha, view);
+                    NSStringFromClass([view.superview class]));
 }
 
-- (void)hideTriggerAreas {
-    if (self.overlayWindow.hidden) {
-        return;
-    }
-    [self stopFade];
-    self.indicatorView.previewMode = NO;
-    self.indicatorView.alpha = 1.0;
-    self.overlayWindow.hidden = YES;
-    os_log(EdgeURLAnimationLog(), "trigger areas hidden");
-}
-
-- (void)fadeOutFromProgress:(CGFloat)progress {
-    if (self.overlayWindow == nil || self.overlayWindow.hidden) {
+// The wave goes back the way it came: the capsule shrinks into the edge, and
+// only the last part of that fades out. This is how Android's back gesture
+// leaves the screen, and it reads as the finger pulling the wave back rather
+// than a bar blinking off.
+- (void)recedeFromProgress:(CGFloat)progress {
+    if (self.indicatorView.superview == nil) {
         return;
     }
     self.fadeFromProgress = MIN(1.0, MAX(0.0, progress));
     self.fadeStartTime = CACurrentMediaTime();
     [self stopFade];
-    CADisplayLink *link = [CADisplayLink displayLinkWithTarget:self selector:@selector(stepFade:)];
+    CADisplayLink *link = [CADisplayLink displayLinkWithTarget:self selector:@selector(stepRecede:)];
     [link addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
     self.fadeLink = link;
 }
 
-- (void)stepFade:(CADisplayLink *)link {
+- (void)stepRecede:(CADisplayLink *)link {
     CFTimeInterval elapsed = CACurrentMediaTime() - self.fadeStartTime;
     CGFloat unit = EdgeURLFadeDuration > 0.0 ? (CGFloat)(elapsed / EdgeURLFadeDuration) : 1.0;
     CGFloat t = MIN(1.0, MAX(0.0, unit));
-    // Ease out, so the wave finishes growing as it fades.
+    // Ease out, so the wave shoots back towards the edge and settles there.
     CGFloat eased = 1.0 - pow(1.0 - t, 3.0);
-    self.indicatorView.progress = self.fadeFromProgress + (1.0 - self.fadeFromProgress) * eased;
-    self.indicatorView.alpha = 1.0 - eased;
+    self.indicatorView.progress = self.fadeFromProgress * (1.0 - eased);
+    CGFloat remaining = (t > 0.55) ? (1.0 - (t - 0.55) / 0.45) : 1.0;
+    self.indicatorView.alpha = MAX(0.0, remaining);
     [self.indicatorView setNeedsDisplay];
     if (t >= 1.0) {
         [self stopFade];
         self.indicatorView.alpha = 1.0;
         self.indicatorView.progress = 0.0;
-        self.overlayWindow.hidden = YES;
-        // The wave is done; the trigger area it covered comes back.
+        // The wave is gone; the trigger area it covered comes back.
         [self updateTriggerAreas];
     }
 }

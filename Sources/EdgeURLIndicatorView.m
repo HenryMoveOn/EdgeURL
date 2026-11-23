@@ -127,42 +127,95 @@ static CGRect EdgeURLEdgeRect(CGFloat screenWidth, BOOL left, CGFloat width, CGF
 
 // The wave: a translucent capsule that grows inward and brightens with
 // progress, with a chevron that grows the same way.
+// The Android back gesture's look: a capsule flush with the edge that grows
+// longer and thicker as the finger moves in, a soft glow that spreads from the
+// edge, and an arrow that fades in at full brightness. Two shorter, fainter
+// capsules trail above and below it, which is what makes it read as a wave
+// sliding along the edge rather than a bar that appears.
 - (void)drawWaveWithWidth:(CGFloat)width
                    height:(CGFloat)height
                      left:(BOOL)left
                      band:(CGFloat)band
                  progress:(CGFloat)progress {
-    CGFloat capsuleHeight = 38.0 + 70.0 * progress;
-    CGFloat innerWidth = 5.0 + MAX(0.0, band * 0.7 - 5.0) * progress;
-    CGFloat half = capsuleHeight * 0.5;
-    CGFloat centerY = EdgeURLClamped(self.touchY, half + 6.0, height - half - 6.0);
-    CGFloat top = centerY - half;
+    CGContextRef context = UIGraphicsGetCurrentContext();
+    if (context == NULL) {
+        return;
+    }
+    CGFloat depth = 6.0 + MAX(0.0, MIN(band, 46.0) - 6.0) * (0.2 + 0.8 * progress);
+    CGFloat length = 46.0 + 86.0 * progress;
+    CGFloat half = length * 0.5;
+    CGFloat centerY = EdgeURLClamped(self.touchY, half + 14.0, height - half - 14.0);
 
-    CGRect glowRect = EdgeURLEdgeRect(width, left, innerWidth + 16.0, top - 5.0, capsuleHeight + 10.0);
-    UIBezierPath *glow = [UIBezierPath bezierPathWithRoundedRect:glowRect
-                                                        cornerRadius:(capsuleHeight + 10.0) * 0.5];
-    [EdgeURLTint(0.05 + 0.12 * progress) setFill];
-    [glow fill];
+    // Glow: a gradient from the edge inward, so the band has no visible end.
+    CGFloat glowWidth = depth + 20.0 + 24.0 * progress;
+    CGRect glowRect = EdgeURLEdgeRect(width, left, glowWidth, centerY - half - 18.0, length + 36.0);
+    UIBezierPath *glowPath = [UIBezierPath bezierPathWithRoundedRect:glowRect
+                                                            cornerRadius:glowWidth * 0.5];
+    CGContextSaveGState(context);
+    [glowPath addClip];
+    CGFloat glowAlpha = 0.10 + 0.20 * progress;
+    NSArray *glowColors = @[(id)[EdgeURLTint(glowAlpha) CGColor],
+                            (id)[EdgeURLTint(0.0) CGColor]];
+    CGFloat glowLocations[2] = {0.0, 1.0};
+    CGGradientRef gradient = CGGradientCreateWithColors(NULL,
+                                                        (__bridge CFArrayRef)glowColors,
+                                                        glowLocations);
+    if (gradient != NULL) {
+        CGFloat startX = left ? 0.0 : width;
+        CGFloat endX = left ? glowWidth : width - glowWidth;
+        CGContextDrawLinearGradient(context, gradient,
+                                    CGPointMake(startX, centerY),
+                                    CGPointMake(endX, centerY),
+                                    kCGGradientDrawsBeforeStartLocation);
+        CGGradientRelease(gradient);
+    }
+    CGContextRestoreGState(context);
 
-    CGRect capsuleRect = EdgeURLEdgeRect(width, left, innerWidth, top, capsuleHeight);
+    // The wake: two shorter capsules either side of the finger, fading out.
+    for (NSInteger step = 1; step <= 2; step++) {
+        CGFloat distance = half * 0.55 + step * 17.0;
+        CGFloat wakeLength = length * (0.62 - 0.16 * step);
+        CGFloat wakeHalf = wakeLength * 0.5;
+        CGFloat wakeY = centerY + (step % 2 == 0 ? -distance : distance);
+        wakeY = EdgeURLClamped(wakeY, wakeHalf + 4.0, height - wakeHalf - 4.0);
+        CGRect wakeRect = EdgeURLEdgeRect(width, left, depth * 0.7, wakeY - wakeHalf, wakeLength);
+        UIBezierPath *wake = [UIBezierPath bezierPathWithRoundedRect:wakeRect
+                                                           cornerRadius:depth * 0.35];
+        [EdgeURLTint((0.06 + 0.08 * progress) / (CGFloat)step) setFill];
+        [wake fill];
+    }
+
+    // The capsule itself, in three passes so its middle is the brightest.
+    CGRect capsuleRect = EdgeURLEdgeRect(width, left, depth, centerY - half, length);
     UIBezierPath *capsule = [UIBezierPath bezierPathWithRoundedRect:capsuleRect
-                                                           cornerRadius:innerWidth * 0.5];
-    [EdgeURLTint(0.16 + 0.34 * progress) setFill];
+                                                          cornerRadius:depth * 0.5];
+    [EdgeURLTint(0.18 + 0.30 * progress) setFill];
     [capsule fill];
 
-    CGFloat size = 4.5 + 3.5 * progress;
-    CGFloat offset = MAX(innerWidth * 0.55, size + 3.0);
-    CGFloat centerX = left ? offset : width - offset;
-    CGFloat tip = left ? size * 0.55 : -size * 0.55;
-    UIBezierPath *chevron = [UIBezierPath bezierPath];
-    [chevron moveToPoint:CGPointMake(centerX - tip, centerY - size)];
-    [chevron addLineToPoint:CGPointMake(centerX + tip, centerY)];
-    [chevron addLineToPoint:CGPointMake(centerX - tip, centerY + size)];
-    chevron.lineWidth = 2.4;
-    chevron.lineCapStyle = kCGLineCapRound;
-    chevron.lineJoinStyle = kCGLineJoinRound;
-    [[UIColor colorWithWhite:1.0 alpha:0.5 + 0.45 * progress] setStroke];
-    [chevron stroke];
+    CGRect coreRect = EdgeURLEdgeRect(width, left, depth * 0.45, centerY - half + 3.0, length - 6.0);
+    UIBezierPath *core = [UIBezierPath bezierPathWithRoundedRect:coreRect
+                                                       cornerRadius:depth * 0.25];
+    [EdgeURLTint(0.30 + 0.45 * progress) setFill];
+    [core fill];
+
+    // The arrow, pointing the way the swipe goes, once there is something to
+    // act on.
+    CGFloat arrowIn = EdgeURLClamped((progress - 0.2) / 0.4, 0.0, 1.0);
+    if (arrowIn <= 0.001) {
+        return;
+    }
+    CGFloat direction = left ? 1.0 : -1.0;
+    CGFloat size = (4.0 + 4.0 * progress) * (0.6 + 0.4 * arrowIn);
+    CGFloat centerX = left ? depth + size + 7.0 : width - depth - size - 7.0;
+    UIBezierPath *arrow = [UIBezierPath bezierPath];
+    [arrow moveToPoint:CGPointMake(centerX - direction * size * 0.55, centerY - size)];
+    [arrow addLineToPoint:CGPointMake(centerX + direction * size * 0.55, centerY)];
+    [arrow addLineToPoint:CGPointMake(centerX - direction * size * 0.55, centerY + size)];
+    arrow.lineWidth = 2.2 + 1.0 * progress;
+    arrow.lineCapStyle = kCGLineCapRound;
+    arrow.lineJoinStyle = kCGLineJoinRound;
+    [[UIColor colorWithWhite:1.0 alpha:(0.35 + 0.55 * progress) * arrowIn] setStroke];
+    [arrow stroke];
 }
 
 // What 0.1.x drew, kept for Animated = NO.

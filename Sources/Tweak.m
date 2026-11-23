@@ -2,8 +2,9 @@
 // Copyright (c) 2026 OwnGoal Studio
 //
 // The tweak's only entry point: install one hook, then hand over to the
-// gesture controller, which registers its pan with SpringBoard's window scene
-// through the system gesture manager. No window of ours ever receives a touch.
+// gesture controller, which puts its recognizers on SpringBoard's own home
+// screen windows and draws the wave inside one of them. No system gesture
+// manager, no window of the tweak's own.
 //
 // The build defines APELIN_PACKAGE_ID, APELIN_VERSION and APELIN_BUILD_ID as
 // string literals on every compile.

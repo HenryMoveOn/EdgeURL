@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: MIT
 //
-// The private UIKit surface EdgeURL needs: a window scene's system gesture
-// manager, which hands us touches before the frontmost app sees them. The SDK
-// ships no declarations for it, so only the selectors used here are declared.
+// Nothing here any more. The tweak used to hand its recognizer to the window
+// scene's system gesture manager, which the SDK does not declare; SpringBoard
+// refuses recognizers put in a slot it has taken, and the refusal ended the
+// process. Touches are now taken from SpringBoard's own windows, which needs
+// no private API at all.
 #import <UIKit/UIKit.h>
-
-@interface UISystemGestureManager : NSObject
-- (void)addGestureRecognizer:(UIGestureRecognizer *)recognizer withType:(NSUInteger)type;
-- (void)removeGestureRecognizer:(UIGestureRecognizer *)recognizer;
-@end
-
-@interface UIWindowScene (EdgeURLSystemGesture)
-- (UISystemGestureManager *)systemGestureManager;
-@end
