@@ -28,11 +28,13 @@
 
 #import <QuartzCore/QuartzCore.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <notify.h>
 #import <os/log.h>
 #import <fcntl.h>
 #import <stdarg.h>
 #import <unistd.h>
+#import <dlfcn.h>
 
 // The wave goes back into the edge in this long; Android's own cancel takes a
 // little less than a fifth of a second.
@@ -297,9 +299,9 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     if (scene == nil) {
         return NO;
     }
-    if ([self coverSheetIsUpInScene:scene]) {
-        return NO;
-    }
+    // The home screen window is hidden while an app is in front and while the
+    // lock screen is up. Nothing else is asked: a touch from inside an app never
+    // reaches these recognizers anyway, since they live on SpringBoard's windows.
     return [self homeScreenIsShowingInScene:scene];
 }
 
@@ -351,6 +353,12 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
 
 - (CGPoint)displayPointForViewPoint:(CGPoint)point inView:(UIView *)view {
     if (view == nil) {
+        return point;
+    }
+    // A window that has just left its scene reports no window; these watchers sit
+    // on full-screen windows whose own space is the display, so the point needs
+    // no conversion then.
+    if (view.window == nil) {
         return point;
     }
     return [view convertPoint:point toCoordinateSpace:[UIScreen mainScreen].coordinateSpace];
@@ -582,18 +590,16 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
 // screen window looks at that moment. Logged whenever it changes.
 - (void)logGateStateInScene:(UIWindowScene *)scene {
     UIWindow *desktop = (UIWindow *)[self desktopViewInScene:scene];
-    NSString *key = [NSString stringWithFormat:@"%@|%d|%.2f|%d|%d",
+    NSString *key = [NSString stringWithFormat:@"%@|%d|%.2f|%d",
                      NSStringFromClass([desktop class]), desktop.hidden, desktop.alpha,
-                     [self coverSheetIsUpInScene:scene],
                      [self homeScreenIsShowingInScene:scene]];
     if ([key isEqualToString:self.gateStateKey]) {
         return;
     }
     self.gateStateKey = key;
-    EdgeURLDebugLog(@"gate desktop=%@ hidden=%d alpha=%.2f cover=%@ show=%d",
+    EdgeURLDebugLog(@"gate desktop=%@ hidden=%d alpha=%.2f show=%d",
                     NSStringFromClass([desktop class]), desktop.hidden, desktop.alpha,
-                    [self coverSheetIsUpInScene:scene] ? @"yes" : @"no",
-                    [self homeScreenIsShowingInScene:scene]);
+                    [self shouldShowInScene:scene]);
 }
 
 - (void)sceneDidChange:(NSNotification *)notification {
@@ -616,15 +622,18 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     }
     // The watchers stay on SpringBoard's windows for the whole session; this is
     // what keeps them quiet while an app or the lock screen is what is on show.
+    // The window a touch lands in can be gone from its scene by the time the
+    // recognizer reports it — SpringBoard rebuilds them constantly — so the
+    // scene falls back to the main one rather than reading as "no desktop".
     UIWindowScene *scene = recognizer.view.window.windowScene;
-    BOOL cover = [self coverSheetIsUpInScene:scene];
-    BOOL showing = [self homeScreenIsShowingInScene:scene];
-    if (!showing || cover) {
+    if (scene == nil) {
+        scene = [self mainScene];
+    }
+    BOOL showing = [self shouldShowInScene:scene];
+    if (!showing) {
         UIWindow *desktop = (UIWindow *)[self desktopViewInScene:scene];
-        EdgeURLDebugLog(@"touch down ignored: cover=%d desktop=%@ hidden=%d alpha=%.2f scene=%@ window=%@",
-                        cover, NSStringFromClass([desktop class]), desktop.hidden, desktop.alpha,
-                        NSStringFromClass([scene class]),
-                        NSStringFromClass([recognizer.view.window class]));
+        EdgeURLDebugLog(@"touch down ignored: desktop=%@ hidden=%d alpha=%.2f",
+                        NSStringFromClass([desktop class]), desktop.hidden, desktop.alpha);
         return NO;
     }
     CGPoint display = [self displayPointForViewPoint:point inView:recognizer.view];
