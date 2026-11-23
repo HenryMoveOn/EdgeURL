@@ -150,6 +150,8 @@ static BOOL EdgeURLDeviceIsLocked(NSString **reason) {
 @property (nonatomic, strong) NSMutableArray<EdgeURLPanRecognizer *> *recognizers;
 @property (nonatomic, strong) CADisplayLink *fadeLink;
 @property (nonatomic, strong) EdgeURLSettings *settings;
+// Kept between gestures so the Taptic Engine is ready when the swipe commits.
+@property (nonatomic, strong) UIImpactFeedbackGenerator *hapticGenerator;
 
 @property (nonatomic, assign) BOOL started;
 @property (nonatomic, assign) BOOL watchdogStarted;
@@ -729,6 +731,9 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     self.active = YES;
     self.brightened = NO;
     [self stopFade];
+    if (settings.haptic) {
+        [self prepareHaptic];
+    }
     // The band above the apps would be drawn over the panel the desktop is about
     // to draw, so it goes at once: the watchdog does not reconcile while a touch
     // is being tracked, and waiting for it would leave the band there.
@@ -775,14 +780,29 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
 
     if (progress >= 1.0 && !self.brightened) {
         self.brightened = YES;
-        UIImpactFeedbackGenerator *generator =
-            [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-        [generator impactOccurred];
         os_log(EdgeURLAnimationLog(), "panel at full size travel=%.1f threshold=%.1f",
                travel, settings.threshold);
     } else if (progress < 1.0) {
         self.brightened = NO;
     }
+}
+
+// One light tap, at the moment the swipe commits: the same moment the URL opens.
+// The setting is read here, so switching it off silences it at once.
+- (void)prepareHaptic {
+    if (self.hapticGenerator == nil) {
+        self.hapticGenerator =
+            [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    }
+    [self.hapticGenerator prepare];
+}
+
+- (void)performHapticIfEnabled:(BOOL)enabled {
+    if (!enabled) {
+        return;
+    }
+    [self prepareHaptic];
+    [self.hapticGenerator impactOccurred];
 }
 
 - (void)endEdgePan:(EdgeURLPanRecognizer *)recognizer cancelled:(BOOL)cancelled {
@@ -811,6 +831,7 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     self.active = NO;
     [self recedeFromProgress:MAX(EdgeURLFraction(progress), 0.25)];
     if (opens) {
+        [self performHapticIfEnabled:settings.haptic];
         // The panel recedes first: opening straight away would take the desktop
         // away and the animation with it before it had been seen. Android's own
         // commit is shorter than this, so the wait is under a fifth of a second.
