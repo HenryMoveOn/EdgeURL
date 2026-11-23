@@ -333,22 +333,13 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     return [UIScreen mainScreen].coordinateSpace.bounds;
 }
 
-// The sensing area, and the band that is drawn, from one place: the edge setting
-// says which edges, the width setting says how wide, and the region says how far
-// down the edge.
-- (CGRect)bandRectForSettings:(EdgeURLSettings *)settings left:(BOOL)left {
-    CGRect display = [self displayBounds];
-    CGFloat displayWidth = CGRectGetWidth(display);
-    CGFloat displayHeight = CGRectGetHeight(display);
-    if (displayWidth < 2.0 || displayHeight < 2.0) {
-        return CGRectZero;
-    }
-    CGFloat band = MIN(MAX(settings.edgeWidth, 6.0), displayWidth * 0.5);
-    CGFloat top = CGRectGetMinY(display) + displayHeight * settings.regionTop / 100.0;
-    CGFloat height = displayHeight * settings.regionHeight / 100.0;
-    height = MAX(1.0, MIN(height, CGRectGetMaxY(display) - top));
-    CGFloat x = left ? CGRectGetMinX(display) : CGRectGetMaxX(display) - band;
-    return CGRectMake(x, top, band, height);
+// The sensing area, and the bar that is drawn, from one place: the edge setting
+// says which edges, the width setting says how wide, the region says where along
+// the edge and how much of it the bar may take. Nothing else on the desktop is
+// watched or drawn.
+- (CGRect)sensingRectForSettings:(EdgeURLSettings *)settings left:(BOOL)left {
+    return EdgeURLSensingRect([self displayBounds], left, settings.edgeWidth,
+                              settings.regionTop, settings.regionHeight);
 }
 
 - (CGPoint)displayPointForViewPoint:(CGPoint)point inView:(UIView *)view {
@@ -380,7 +371,7 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     return [host convertPoint:point fromCoordinateSpace:[UIScreen mainScreen].coordinateSpace];
 }
 
-- (BOOL)displayPoint:(CGPoint)point isInBandWithSettings:(EdgeURLSettings *)settings edge:(EdgeURLEdge *)edge {
+- (BOOL)displayPoint:(CGPoint)point isInSensingAreaWithSettings:(EdgeURLSettings *)settings edge:(EdgeURLEdge *)edge {
     for (NSInteger index = 0; index < 2; index++) {
         BOOL left = (index == 0);
         if (left && !settings.leftEdge) {
@@ -389,7 +380,11 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
         if (!left && !settings.rightEdge) {
             continue;
         }
-        if (CGRectContainsPoint([self bandRectForSettings:settings left:left], point)) {
+        CGRect area = [self sensingRectForSettings:settings left:left];
+        if (CGRectGetWidth(area) < 1.0 || CGRectGetHeight(area) < 1.0) {
+            continue;
+        }
+        if (CGRectContainsPoint(area, point)) {
             if (edge != NULL) {
                 *edge = left ? EdgeURLEdgeLeft : EdgeURLEdgeRight;
             }
@@ -638,7 +633,7 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     }
     CGPoint display = [self displayPointForViewPoint:point inView:recognizer.view];
     EdgeURLEdge found = EdgeURLEdgeLeft;
-    if (![self displayPoint:display isInBandWithSettings:settings edge:&found]) {
+    if (![self displayPoint:display isInSensingAreaWithSettings:settings edge:&found]) {
         return NO;
     }
     if (edge != NULL) {
@@ -860,9 +855,11 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
            "trigger areas shown left=%d right=%d alpha=%.2f width=%.1f top=%.1f height=%.1f",
            settings.leftEdge, settings.rightEdge, settings.areaAlpha,
            settings.edgeWidth, settings.regionTop, settings.regionHeight);
-    EdgeURLDebugLog(@"band shown left=%d right=%d alpha=%.2f show=%d",
+    EdgeURLDebugLog(@"band shown left=%d right=%d alpha=%.2f show=%d left=%@ right=%@",
                     settings.leftEdge, settings.rightEdge, settings.areaAlpha,
-                    settings.showArea);
+                    settings.showArea,
+                    NSStringFromCGRect([self sensingRectForSettings:settings left:YES]),
+                    NSStringFromCGRect([self sensingRectForSettings:settings left:NO]));
 }
 
 // The panel goes back the way it came: it shrinks into the edge, and only the

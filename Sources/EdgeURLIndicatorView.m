@@ -21,10 +21,39 @@ static UIColor *EdgeURLTint(CGFloat alpha) {
     return [[UIColor systemBlueColor] colorWithAlphaComponent:alpha];
 }
 
-// A band `width` wide flush against the named edge.
-static CGRect EdgeURLEdgeRect(CGFloat screenWidth, BOOL left, CGFloat width, CGFloat y, CGFloat height) {
-    CGFloat minX = left ? 0.0 : screenWidth - width;
-    return CGRectMake(minX, y, width, height);
+#pragma mark - The sensing area
+
+// The rest panel itself is 11 by 44 points; a finger needs more than that, so
+// the area it is sensed in is as tall as the configured region gives it, within
+// these bounds, and centred on the region's own middle. That is the whole of the
+// screen a swipe is taken from: everywhere else is left alone and undrawn.
+static const CGFloat EdgeURLSensingMinLength = 56.0;
+static const CGFloat EdgeURLSensingMaxLength = 96.0;
+
+CGRect EdgeURLSensingRect(CGRect display,
+                          BOOL left,
+                          CGFloat bandWidth,
+                          CGFloat regionTopPercent,
+                          CGFloat regionHeightPercent) {
+    CGFloat displayWidth = CGRectGetWidth(display);
+    CGFloat displayHeight = CGRectGetHeight(display);
+    if (displayWidth < 2.0 || displayHeight < 2.0) {
+        return CGRectZero;
+    }
+    CGFloat band = EdgeURLClamped(bandWidth, 16.0, displayWidth * 0.5);
+    CGFloat top = CGRectGetMinY(display) +
+                  displayHeight * EdgeURLClamped(regionTopPercent, 0.0, 100.0) / 100.0;
+    CGFloat region = displayHeight * EdgeURLClamped(regionHeightPercent, 0.0, 100.0) / 100.0;
+    region = MAX(1.0, MIN(region, CGRectGetMaxY(display) - top));
+    CGFloat length = MIN(EdgeURLClamped(region, EdgeURLSensingMinLength,
+                                        EdgeURLSensingMaxLength),
+                         displayHeight);
+    CGFloat centerY = top + region * 0.5;
+    CGFloat minY = EdgeURLClamped(centerY - length * 0.5,
+                                  CGRectGetMinY(display),
+                                  CGRectGetMaxY(display) - length);
+    CGFloat minX = left ? CGRectGetMinX(display) : CGRectGetMaxX(display) - band;
+    return CGRectMake(minX, minY, band, length);
 }
 
 #pragma mark - Android's easing
@@ -157,22 +186,18 @@ static const CGFloat EdgeURLArrowStroke = 2.4;
     CGFloat band = EdgeURLClamped(self.bandWidth, 6.0, width * 0.5);
     CGFloat progress = EdgeURLClamped(self.progress, 0.0, 1.0);
 
-    if (self.showArea && self.areaAlpha > 0.001) {
-        if (self.previewMode) {
-            // The preview shows where the trigger is, on every enabled edge,
-            // and nothing else.
-            if (self.leftEdgeEnabled) {
-                [self drawTriggerAreaLeft:YES width:width height:height band:band];
-            }
-            if (self.rightEdgeEnabled) {
-                [self drawTriggerAreaLeft:NO width:width height:height band:band];
-            }
+    if (self.previewMode) {
+        // At rest, and while a setting is being tried: the sensing area on every
+        // enabled edge, and nothing else on the screen.
+        if (!self.showArea || self.areaAlpha <= 0.001) {
             return;
         }
-        [self drawTriggerAreaLeft:left width:width height:height band:band];
-    }
-
-    if (self.previewMode) {
+        if (self.leftEdgeEnabled) {
+            [self drawSensingAreaLeft:YES width:width height:height band:band];
+        }
+        if (self.rightEdgeEnabled) {
+            [self drawSensingAreaLeft:NO width:width height:height band:band];
+        }
         return;
     }
     if (self.animatedStyle) {
@@ -182,20 +207,20 @@ static const CGFloat EdgeURLArrowStroke = 2.4;
     }
 }
 
-// One fill, at exactly the opacity the slider holds.
-- (void)drawTriggerAreaLeft:(BOOL)left
+// One fill, at exactly the opacity the slider holds, over the rect a swipe is
+// taken from: the only thing drawn on the desktop when nothing is happening, so
+// the rest of the screen stays exactly as it was.
+- (void)drawSensingAreaLeft:(BOOL)left
                       width:(CGFloat)width
                      height:(CGFloat)height
                        band:(CGFloat)band {
-    CGFloat top = height * EdgeURLClamped(self.regionTop, 0.0, 100.0) / 100.0;
-    CGFloat areaHeight = height * EdgeURLClamped(self.regionHeight, 0.0, 100.0) / 100.0;
-    areaHeight = MIN(areaHeight, height - top);
-    if (areaHeight <= 1.0) {
+    CGRect areaRect = EdgeURLSensingRect(CGRectMake(0.0, 0.0, width, height), left, band,
+                                         self.regionTop, self.regionHeight);
+    if (CGRectGetWidth(areaRect) < 1.0 || CGRectGetHeight(areaRect) < 1.0) {
         return;
     }
-    CGRect areaRect = EdgeURLEdgeRect(width, left, band, top, areaHeight);
-    UIBezierPath *area = [UIBezierPath bezierPathWithRoundedRect:areaRect
-                                                       cornerRadius:MIN(12.0, band * 0.5)];
+    CGFloat far = MIN(CGRectGetWidth(areaRect) * 0.5, 11.0);
+    UIBezierPath *area = EdgeURLPanelPath(areaRect, 3.0, far, left);
     [EdgeURLTint(EdgeURLClamped(self.areaAlpha, 0.0, 1.0)) setFill];
     [area fill];
 }

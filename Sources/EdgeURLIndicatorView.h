@@ -11,6 +11,16 @@ typedef NS_ENUM(NSInteger, EdgeURLEdge) {
     EdgeURLEdgeRight = 1,
 };
 
+/// The sensing area on one edge, in display coordinates: the small bar a swipe
+/// has to start in, and the only place on the screen one is taken from. It is
+/// centred on the middle of the configured region, and as tall as that region
+/// allows, within the size of a comfortable target.
+FOUNDATION_EXPORT CGRect EdgeURLSensingRect(CGRect display,
+                                            BOOL left,
+                                            CGFloat bandWidth,
+                                            CGFloat regionTopPercent,
+                                            CGFloat regionHeightPercent);
+
 @interface EdgeURLIndicatorView : UIView
 
 @property (nonatomic, assign) EdgeURLEdge edge;
