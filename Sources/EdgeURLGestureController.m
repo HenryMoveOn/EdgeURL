@@ -136,6 +136,34 @@ static BOOL EdgeURLDeviceIsLocked(NSString **reason) {
     return NO;
 }
 
+// Spotlight is not an app. SpringBoard puts its search in a scene of its own over
+// the desktop and the home screen window stays visible under it, so nothing that
+// only asks SpringBoard's windows can tell the search from the desktop. The search
+// view controller is SpringBoard's own, though: a child of the home screen
+// window's controller tree, and its view is in a window exactly while the search
+// is up. The class is found by name, and its own name is all that is asked of it.
+static UIViewController *EdgeURLSpotlightControllerIn(UIViewController *controller,
+                                                      NSInteger depth) {
+    if (controller == nil || depth > 12) {
+        return nil;
+    }
+    if ([NSStringFromClass([controller class]) containsString:@"Spotlight"]) {
+        return controller;
+    }
+    UIViewController *found = EdgeURLSpotlightControllerIn(controller.presentedViewController,
+                                                           depth + 1);
+    if (found != nil) {
+        return found;
+    }
+    for (UIViewController *child in controller.childViewControllers) {
+        found = EdgeURLSpotlightControllerIn(child, depth + 1);
+        if (found != nil) {
+            return found;
+        }
+    }
+    return nil;
+}
+
 @interface EdgeURLGestureController () <EdgeURLPanRecognizerDelegate>
 
 @property (nonatomic, strong) EdgeURLIndicatorView *indicatorView;
@@ -155,6 +183,14 @@ static BOOL EdgeURLDeviceIsLocked(NSString **reason) {
 
 @property (nonatomic, assign) BOOL started;
 @property (nonatomic, assign) BOOL watchdogStarted;
+/// Spotlight's search is what is on show. It is not an app: its scene sits over
+/// the desktop without hiding it, so this is asked of SpringBoard's own search
+/// view controller instead of the home screen window.
+@property (nonatomic, assign) BOOL spotlightShowing;
+/// The class of the search view controller this build found, or nil: kept only so
+/// a log line can say what the search was asked about.
+@property (nonatomic, copy) NSString *spotlightController;
+@property (nonatomic, assign) BOOL spotlightProbeLogged;
 
 @property (nonatomic, copy) NSString *bandStateKey;
 @property (nonatomic, copy) NSString *appBandStateKey;
@@ -357,6 +393,34 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     return !desktop.hidden && desktop.alpha > 0.01;
 }
 
+// Whether the search is over the desktop. Its view being in a window is what the
+// search being up means: SpringBoard adds the search's view only to show it, and
+// takes it out again on the way back, so a search being pulled down or pushed
+// back up counts as up for as long as its view is there.
+- (BOOL)spotlightIsShowingInScene:(UIWindowScene *)scene {
+    UIWindow *desktop = (UIWindow *)[self desktopViewInScene:scene];
+    UIViewController *root = desktop.rootViewController;
+    if (root == nil) {
+        for (UIWindow *window in scene.windows) {
+            if (window.rootViewController != nil) {
+                root = window.rootViewController;
+                break;
+            }
+        }
+    }
+    UIViewController *controller = EdgeURLSpotlightControllerIn(root, 0);
+    if (controller == nil) {
+        self.spotlightController = nil;
+        return NO;
+    }
+    self.spotlightController = NSStringFromClass([controller class]);
+    if (!controller.isViewLoaded) {
+        return NO;
+    }
+    UIView *view = controller.view;
+    return view.window != nil && !view.hidden && view.alpha > 0.01;
+}
+
 #pragma mark - Geometry
 
 - (CGRect)displayBounds {
@@ -458,6 +522,26 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     if (scene == nil) {
         return;
     }
+    BOOL spotlight = [self spotlightIsShowingInScene:scene];
+    if (spotlight != self.spotlightShowing) {
+        self.spotlightShowing = spotlight;
+        // The trigger area is drawn with and without the search, so it is redrawn
+        // and the band over the apps is laid out again rather than left as it was.
+        self.bandStateKey = nil;
+        self.appBandStateKey = nil;
+        os_log(EdgeURLGestureLog(), "search showing=%d controller=%{public}s",
+               spotlight, self.spotlightController.UTF8String ?: "(none)");
+        if (spotlight && self.active) {
+            // The search came over a swipe in progress: it is dropped where it is,
+            // the way it is when the setting is switched off.
+            [self finishWithProgress:self.indicatorView.progress opens:NO];
+        }
+    }
+    if (!self.spotlightProbeLogged && self.spotlightController != nil) {
+        self.spotlightProbeLogged = YES;
+        os_log(EdgeURLGestureLog(), "search found %{public}s showing=%d",
+               self.spotlightController.UTF8String, spotlight);
+    }
     [self attachToDesktopInScene:scene];
     [self syncRecognizersInScene:scene];
     [self updateTriggerAreas];
@@ -518,8 +602,12 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     // A swipe, and the return that follows it, is drawn by the desktop: this window
     // would be over it, so it steps aside until both are over.
     BOOL busy = self.active || self.fadeLink != nil;
+    // The band is drawn here over whatever is in front, the desktop included: the
+    // two copies sit at the same place in the same tint, so nothing doubled shows,
+    // and whether the home screen window counts as visible under an app is not
+    // something SpringBoard answers. Only the search turns this one off.
     BOOL wanted = settings.enabled && settings.showArea && settings.areaAlpha > 0.001 &&
-                  !locked && !busy;
+                  !locked && !busy && !self.spotlightShowing;
     NSString *key = [NSString stringWithFormat:@"%d|%d|%d|%d|%@", wanted, locked,
                      busy, settings.leftEdge, lockReason];
     if (![key isEqualToString:self.appBandStateKey]) {
@@ -696,6 +784,11 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     if (!showing) {
         return NO;
     }
+    // The search stays over the desktop without hiding it, and a swipe there is
+    // not this gesture's: it starts no panel and opens nothing.
+    if ([self spotlightIsShowingInScene:scene]) {
+        return NO;
+    }
     CGPoint display = [self displayPointForViewPoint:point inView:recognizer.view];
     EdgeURLEdge found = EdgeURLEdgeLeft;
     if (![self displayPoint:display isInSensingAreaWithSettings:settings edge:&found]) {
@@ -809,6 +902,7 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     }
     [self prepareHaptic];
     [self.hapticGenerator impactOccurred];
+    os_log(EdgeURLGestureLog(), "haptic light impact");
 }
 
 - (void)endEdgePan:(EdgeURLPanRecognizer *)recognizer cancelled:(BOOL)cancelled {
@@ -896,7 +990,7 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     view.regionTop = settings.regionTop;
     view.regionHeight = settings.regionHeight;
     view.areaAlpha = settings.areaAlpha;
-    view.showArea = settings.showArea;
+    view.showArea = settings.showArea && !self.spotlightShowing;
     view.animatedStyle = settings.animated;
     view.leftEdgeEnabled = settings.leftEdge;
     view.rightEdgeEnabled = settings.rightEdge;
