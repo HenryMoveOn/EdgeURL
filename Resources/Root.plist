@@ -260,6 +260,23 @@
 
 		<dict>
 			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>label</key>
+			<string>Haptic Feedback</string>
+			<key>key</key>
+			<string>Haptic</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>local.apelin.edgeurl</string>
+			<key>PostNotification</key>
+			<string>local.apelin.edgeurl/changed</string>
+			<key>footerText</key>
+			<string>A light tap of the Taptic Engine the moment a swipe commits and the URL opens.</string>
+		</dict>
+
+		<dict>
+			<key>cell</key>
 			<string>PSGroupCell</string>
 			<key>label</key>
 			<string>Restore Defaults</string>

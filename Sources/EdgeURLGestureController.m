@@ -37,10 +37,6 @@
 #import <objc/message.h>
 #import <notify.h>
 #import <os/log.h>
-#import <fcntl.h>
-#import <stdarg.h>
-#import <unistd.h>
-#import <dlfcn.h>
 
 // The wave goes back into the edge in this long; Android's own cancel takes a
 // little less than a fifth of a second.
@@ -50,22 +46,6 @@ static const CFTimeInterval EdgeURLFadeDuration = 0.18;
 // SpringBoard's status bar (1070) and its Control Center (1080), so nothing of
 // the system is covered by it.
 static const UIWindowLevel EdgeURLBandWindowLevel = 1069.0;
-
-// TEMPORARY diagnostic: os_log only answers live listeners, so the same lines
-// also go to a file that survives the gesture.
-static void EdgeURLDebugLog(NSString *format, ...) {
-    va_list args;
-    va_start(args, format);
-    NSString *message = [[NSString alloc] initWithFormat:format arguments:args];
-    va_end(args);
-    NSString *line = [NSString stringWithFormat:@"%.2f %@\n", CACurrentMediaTime(), message];
-    const char *bytes = line.UTF8String;
-    int fd = open("/var/mobile/Library/Caches/EdgeURL-debug.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
-    if (fd >= 0) {
-        write(fd, bytes, strlen(bytes));
-        close(fd);
-    }
-}
 
 static CGFloat EdgeURLFraction(CGFloat value) {
     return MIN(1.0, MAX(0.0, value));
@@ -173,10 +153,8 @@ static BOOL EdgeURLDeviceIsLocked(NSString **reason) {
 
 @property (nonatomic, assign) BOOL started;
 @property (nonatomic, assign) BOOL watchdogStarted;
-@property (nonatomic, assign) BOOL loggedWindows;
 
 @property (nonatomic, copy) NSString *bandStateKey;
-@property (nonatomic, copy) NSString *gateStateKey;
 @property (nonatomic, copy) NSString *appBandStateKey;
 
 @property (nonatomic, assign) EdgeURLEdge activeEdge;
@@ -247,7 +225,6 @@ static BOOL EdgeURLDeviceIsLocked(NSString **reason) {
                                     CFNotificationSuspensionBehaviorDeliverImmediately);
 
     os_log(EdgeURLGestureLog(), "started %{public}s", self.settings.summary.UTF8String);
-    EdgeURLDebugLog(@"started %@", self.settings.summary);
     [self reconcile];
     [self startWatchdog];
 }
@@ -315,7 +292,6 @@ static void EdgeURLPreferencesChanged(CFNotificationCenterRef center,
 - (void)preferencesChanged {
     self.settings = [EdgeURLSettings currentSettings];
     os_log(EdgeURLGestureLog(), "preferences reloaded %{public}s", self.settings.summary.UTF8String);
-    EdgeURLDebugLog(@"prefs changed %@", self.settings.summary);
     if (!self.settings.enabled && self.active) {
         [self finishWithProgress:self.indicatorView.progress opens:NO];
     }
@@ -377,20 +353,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
         return NO;
     }
     return !desktop.hidden && desktop.alpha > 0.01;
-}
-
-// The lock screen is another window of the same scene, and the band belongs to
-// the screen behind it, not over it.
-- (BOOL)coverSheetIsUpInScene:(UIWindowScene *)scene {
-    for (UIWindow *window in scene.windows) {
-        if (![NSStringFromClass([window class]) containsString:@"CoverSheet"]) {
-            continue;
-        }
-        if (!window.hidden && window.alpha > 0.01) {
-            return YES;
-        }
-    }
-    return NO;
 }
 
 #pragma mark - Geometry
@@ -492,18 +454,12 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
 - (void)reconcile {
     UIWindowScene *scene = [self mainScene];
     if (scene == nil) {
-        EdgeURLDebugLog(@"no window scene yet");
         return;
     }
     [self attachToDesktopInScene:scene];
     [self syncRecognizersInScene:scene];
     [self updateTriggerAreas];
     [self updateAppBandsInScene:scene];
-    if (!self.loggedWindows) {
-        self.loggedWindows = YES;
-        [self logDesktopStateInScene:scene];
-    }
-    [self logGateStateInScene:scene];
 }
 
 - (void)attachToDesktopInScene:(UIWindowScene *)scene {
@@ -516,8 +472,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     if (self.desktopView != desktop) {
         [self.indicatorView removeFromSuperview];
         self.desktopView = desktop;
-        EdgeURLDebugLog(@"desktop window %@ level=%.1f",
-                        NSStringFromClass([desktop class]), ((UIWindow *)desktop).windowLevel);
     }
     EdgeURLIndicatorView *view = self.indicatorView;
     CGRect frame = [self frameForDesktopView:desktop];
@@ -525,8 +479,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
         view.frame = frame;
         view.autoresizingMask = UIViewAutoresizingNone;
         [desktop addSubview:view];
-        EdgeURLDebugLog(@"indicator attached frame=%@ bounds=%@",
-                        NSStringFromCGRect(frame), NSStringFromCGRect(desktop.bounds));
         return;
     }
     if (!CGRectEqualToRect(view.frame, frame)) {
@@ -561,15 +513,15 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     EdgeURLSettings *settings = [self currentSettings];
     NSString *lockReason = nil;
     BOOL locked = EdgeURLDeviceIsLocked(&lockReason);
+    // A swipe, and the return that follows it, is drawn by the desktop: this window
+    // would be over it, so it steps aside until both are over.
+    BOOL busy = self.active || self.fadeLink != nil;
     BOOL wanted = settings.enabled && settings.showArea && settings.areaAlpha > 0.001 &&
-                  !locked && !self.active;
+                  !locked && !busy;
     NSString *key = [NSString stringWithFormat:@"%d|%d|%d|%d|%@", wanted, locked,
-                     self.active, settings.leftEdge, lockReason];
+                     busy, settings.leftEdge, lockReason];
     if (![key isEqualToString:self.appBandStateKey]) {
         self.appBandStateKey = key;
-        EdgeURLDebugLog(@"app band locked=%d(%@) active=%d want=%d left=%d right=%d",
-                        locked, lockReason, self.active, wanted,
-                        settings.leftEdge, settings.rightEdge);
     }
     [self syncAppBandLeft:YES inScene:scene settings:settings wanted:wanted && settings.leftEdge];
     [self syncAppBandLeft:NO inScene:scene settings:settings wanted:wanted && settings.rightEdge];
@@ -635,8 +587,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     } else {
         self.rightBandWindow = window;
     }
-    EdgeURLDebugLog(@"app band window %@ level=%.1f",
-                    left ? @"left" : @"right", window.windowLevel);
     return window;
 }
 
@@ -681,9 +631,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
             [watched addObject:view];
         }
     }
-    BOOL changed = NO;
-    NSUInteger removed = 0;
-    NSUInteger added = 0;
     // Watchers whose window is gone, or no longer visible.
     for (EdgeURLPanRecognizer *recognizer in [self.recognizers copy]) {
         UIView *view = recognizer.view;
@@ -694,8 +641,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
             [view removeGestureRecognizer:recognizer];
         }
         [self.recognizers removeObject:recognizer];
-        removed++;
-        changed = YES;
     }
     // Windows that can put a touch into the desktop and have no watcher yet.
     for (UIView *host in hosts) {
@@ -708,55 +653,8 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
         recognizer.edgeDelegate = self;
         [host addGestureRecognizer:recognizer];
         [self.recognizers addObject:recognizer];
-        added++;
-        changed = YES;
     }
     self.hostWindows = hosts;
-    if (changed) {
-        EdgeURLDebugLog(@"watchers %lu (+%lu -%lu)",
-                        (unsigned long)self.recognizers.count,
-                        (unsigned long)added, (unsigned long)removed);
-    }
-}
-
-- (void)detachRecognizers {
-    for (EdgeURLPanRecognizer *recognizer in self.recognizers) {
-        UIView *view = recognizer.view;
-        if (view != nil) {
-            [view removeGestureRecognizer:recognizer];
-        }
-    }
-    [self.recognizers removeAllObjects];
-    self.hostWindows = @[];
-}
-
-// TEMPORARY diagnostic: what the desktop's scene holds, so a window of another
-// tweak that sits above this one can be named.
-- (void)logDesktopStateInScene:(UIWindowScene *)scene {
-    EdgeURLDebugLog(@"scene %@ state=%ld", NSStringFromClass([scene class]),
-                    (long)scene.activationState);
-    for (UIWindow *window in scene.windows) {
-        EdgeURLDebugLog(@"  win %@ level=%.1f hidden=%d alpha=%.2f frame=%@",
-                        NSStringFromClass([window class]), window.windowLevel,
-                        window.hidden, window.alpha, NSStringFromCGRect(window.frame));
-    }
-}
-
-// TEMPORARY diagnostic: the trigger must not fire from inside an app, and the
-// only thing that says whether an app is in front is how SpringBoard's home
-// screen window looks at that moment. Logged whenever it changes.
-- (void)logGateStateInScene:(UIWindowScene *)scene {
-    UIWindow *desktop = (UIWindow *)[self desktopViewInScene:scene];
-    NSString *key = [NSString stringWithFormat:@"%@|%d|%.2f|%d",
-                     NSStringFromClass([desktop class]), desktop.hidden, desktop.alpha,
-                     [self homeScreenIsShowingInScene:scene]];
-    if ([key isEqualToString:self.gateStateKey]) {
-        return;
-    }
-    self.gateStateKey = key;
-    EdgeURLDebugLog(@"gate desktop=%@ hidden=%d alpha=%.2f show=%d",
-                    NSStringFromClass([desktop class]), desktop.hidden, desktop.alpha,
-                    [self shouldShowInScene:scene]);
 }
 
 - (void)sceneDidChange:(NSNotification *)notification {
@@ -788,9 +686,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     }
     BOOL showing = [self shouldShowInScene:scene];
     if (!showing) {
-        UIWindow *desktop = (UIWindow *)[self desktopViewInScene:scene];
-        EdgeURLDebugLog(@"touch down ignored: desktop=%@ hidden=%d alpha=%.2f",
-                        NSStringFromClass([desktop class]), desktop.hidden, desktop.alpha);
         return NO;
     }
     CGPoint display = [self displayPointForViewPoint:point inView:recognizer.view];
@@ -801,8 +696,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     if (edge != NULL) {
         *edge = found;
     }
-    EdgeURLDebugLog(@"touch down (%.1f,%.1f) edge=%d",
-                    display.x, display.y, (int)found);
     return YES;
 }
 
@@ -836,6 +729,11 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     self.active = YES;
     self.brightened = NO;
     [self stopFade];
+    // The band above the apps would be drawn over the panel the desktop is about
+    // to draw, so it goes at once: the watchdog does not reconcile while a touch
+    // is being tracked, and waiting for it would leave the band there.
+    UIWindowScene *scene = recognizer.view.window.windowScene ?: [self mainScene];
+    [self updateAppBandsInScene:scene];
 
     if ([self prepareIndicatorWithSettings:settings]) {
         EdgeURLIndicatorView *view = self.indicatorView;
@@ -850,9 +748,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     os_log(EdgeURLGestureLog(), "tracking edge=%{public}s down=(%.1f,%.1f)",
            EdgeURLGestureName(self.activeEdge).UTF8String,
            self.touchDown.x, self.touchDown.y);
-    EdgeURLDebugLog(@"tracking edge=%d down=(%.1f,%.1f) window=%@",
-                    (int)self.activeEdge, self.touchDown.x, self.touchDown.y,
-                    NSStringFromClass([recognizer.view.window class]));
 }
 
 // Progress is how far the finger has left the edge, over a distance the size of
@@ -908,8 +803,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
            "end edge=%{public}s travel=%.1f minTravel=%.1f cancelled=%d opens=%d",
            EdgeURLGestureName(self.activeEdge).UTF8String, travel,
            settings.minimumTravel, cancelled, opens);
-    EdgeURLDebugLog(@"end edge=%d travel=%.1f opens=%d", (int)self.activeEdge, travel, opens);
-
     [self finishWithProgress:progress opens:opens];
 }
 
@@ -936,7 +829,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
         return;
     }
     os_log(EdgeURLOpenLog(), "opening %{public}s", url.absoluteString.UTF8String);
-    EdgeURLDebugLog(@"opening %@", url.absoluteString);
     dispatch_async(dispatch_get_main_queue(), ^{
         UIApplication *application = [UIApplication sharedApplication];
         [application openURL:url
@@ -1017,11 +909,6 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
            "trigger areas shown left=%d right=%d alpha=%.2f width=%.1f top=%.1f height=%.1f",
            settings.leftEdge, settings.rightEdge, settings.areaAlpha,
            settings.edgeWidth, settings.regionTop, settings.regionHeight);
-    EdgeURLDebugLog(@"band shown left=%d right=%d alpha=%.2f show=%d left=%@ right=%@",
-                    settings.leftEdge, settings.rightEdge, settings.areaAlpha,
-                    settings.showArea,
-                    NSStringFromCGRect([self sensingRectForSettings:settings left:YES]),
-                    NSStringFromCGRect([self sensingRectForSettings:settings left:NO]));
 }
 
 // The panel goes back the way it came: it shrinks into the edge, and only the
@@ -1057,6 +944,7 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
         // The panel is gone; the trigger area it covered comes back.
         self.bandStateKey = nil;
         [self updateTriggerAreas];
+        [self updateAppBandsInScene:[self mainScene]];
     }
 }
 

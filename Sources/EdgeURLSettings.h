@@ -13,6 +13,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, readonly) BOOL rightEdge;
 @property (nonatomic, readonly) BOOL showArea;
 @property (nonatomic, readonly) BOOL animated;
+/// A light tap of the Taptic Engine the moment a swipe commits and the URL is
+/// about to open.
+@property (nonatomic, readonly) BOOL haptic;
 @property (nonatomic, readonly) CGFloat edgeWidth;
 @property (nonatomic, readonly) CGFloat regionTop;
 @property (nonatomic, readonly) CGFloat regionHeight;

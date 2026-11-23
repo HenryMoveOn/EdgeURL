@@ -80,6 +80,7 @@ static NSURL *EdgeURLParseURL(NSString *raw) {
     settings->_rightEdge = EdgeURLReadBool(@"RightEdge", YES);
     settings->_showArea = EdgeURLReadBool(@"ShowArea", YES);
     settings->_animated = EdgeURLReadBool(@"Animated", YES);
+    settings->_haptic = EdgeURLReadBool(@"Haptic", YES);
     settings->_edgeWidth = EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"EdgeWidth", 32.0), 10.0, 80.0);
     settings->_regionTop = EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"RegionTop", 0.0), 0.0, 90.0);
     settings->_regionHeight = EdgeURLClamp((CGFloat)EdgeURLReadNumber(@"RegionHeight", 100.0), 10.0, 100.0);
@@ -94,11 +95,11 @@ static NSURL *EdgeURLParseURL(NSString *raw) {
 
 - (NSString *)summary {
     return [NSString stringWithFormat:
-            @"enabled=%d left=%d right=%d width=%.1f top=%.1f height=%.1f threshold=%.1f minTravel=%.1f animated=%d showArea=%d alpha=%.2f type=%lu url=%@",
+            @"enabled=%d left=%d right=%d width=%.1f top=%.1f height=%.1f threshold=%.1f minTravel=%.1f animated=%d showArea=%d haptic=%d alpha=%.2f type=%lu url=%@",
             self.enabled, self.leftEdge, self.rightEdge,
             self.edgeWidth, self.regionTop, self.regionHeight,
             self.threshold, self.minimumTravel,
-            self.animated, self.showArea, self.areaAlpha,
+            self.animated, self.showArea, self.haptic, self.areaAlpha,
             (unsigned long)self.gestureType,
             self.URL.absoluteString ?: @"(none)"];
 }
