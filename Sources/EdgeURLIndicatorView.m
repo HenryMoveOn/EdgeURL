@@ -94,7 +94,7 @@ static CGFloat EdgeURLPathInterpolator(CGFloat x1, CGFloat y1, CGFloat x2, CGFlo
 
 // A rounded rectangle whose two corners on the edge side are nearly square and
 // whose two corners away from it are round: the shape Android's back panel has.
-static UIBezierPath *EdgeURLPanelPath(CGRect rect, CGFloat nearRadius, CGFloat farRadius, BOOL left) {
+UIBezierPath *EdgeURLPanelPath(CGRect rect, CGFloat nearRadius, CGFloat farRadius, BOOL left) {
     CGFloat minX = CGRectGetMinX(rect);
     CGFloat maxX = CGRectGetMaxX(rect);
     CGFloat minY = CGRectGetMinY(rect);

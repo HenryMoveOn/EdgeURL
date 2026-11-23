@@ -2,16 +2,21 @@
 //
 // The trigger area on the desktop, done the way HomeBarURL does it.
 //
-// This dylib is loaded into SpringBoard and nowhere else. Everything it draws
-// lives inside SpringBoard's own home screen window, which the display keeps
-// below every app's window: the band and the wave are therefore covered by an
-// app by the mere fact of the window order, and no touch of an app can ever
-// reach this tweak — not in the band, not anywhere.
+// This dylib is loaded into SpringBoard and nowhere else. The band and the wave
+// the gesture draws live inside SpringBoard's own home screen window, which the
+// display keeps below every app's window: whatever a swipe draws is therefore
+// covered by an app by the mere fact of the window order.
+//
+// The band alone is drawn a second time, in a window of its own that covers
+// nothing but the band's rect and takes no touch: an app hides the desktop's
+// copy of the band, and this one puts the same band back on top of the app
+// without ever standing between the app and a touch.
 //
 // What ended the earlier attempts, so it is not tried again: UISystemGestureManager
 // (its refusals locked SpringBoard's touches), and a window of this tweak's own
-// above the apps (a touch that reaches SpringBoard in the display's hit test
-// cannot be handed back to another process, so the app lost it for good).
+// spanning the screen above the apps (a touch that reaches SpringBoard in the
+// display's hit test cannot be handed back to another process, so the app lost
+// it for good).
 //
 // The swipe itself is watched by recognizers attached to SpringBoard's own
 // desktop windows: those windows already receive the desktop's touches, and the
@@ -22,6 +27,7 @@
 // All hit testing is done in display coordinates, the screen's coordinate space.
 #import "EdgeURLGestureController.h"
 
+#import "EdgeURLBandView.h"
 #import "EdgeURLIndicatorView.h"
 #import "EdgeURLPanRecognizer.h"
 #import "EdgeURLSettings.h"
@@ -39,6 +45,11 @@
 // The wave goes back into the edge in this long; Android's own cancel takes a
 // little less than a fifth of a second.
 static const CFTimeInterval EdgeURLFadeDuration = 0.18;
+
+// The band drawn over an app sits above the app's own window (level 0) and below
+// SpringBoard's status bar (1070) and its Control Center (1080), so nothing of
+// the system is covered by it.
+static const UIWindowLevel EdgeURLBandWindowLevel = 1069.0;
 
 // TEMPORARY diagnostic: os_log only answers live listeners, so the same lines
 // also go to a file that survives the gesture.
@@ -95,9 +106,63 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
     return edge == EdgeURLEdgeLeft ? @"left" : @"right";
 }
 
+// Whether the lock screen is what is on the display. The home screen window is
+// hidden both while an app is in front and while the device is locked, so this
+// is what tells the two apart before putting the band over an app. The class is
+// SpringBoard's own, looked up rather than linked: without it the answer is "not
+// locked", which is what the band's other conditions already assume.
+static BOOL EdgeURLDeviceIsLocked(NSString **reason) {
+    static Class managerClass;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        managerClass = NSClassFromString(@"SBLockScreenManager");
+    });
+    if (managerClass == Nil) {
+        if (reason != NULL) {
+            *reason = @"SBLockScreenManager missing";
+        }
+        return NO;
+    }
+    id manager = nil;
+    for (NSString *name in @[@"sharedInstance", @"sharedInstanceIfExists"]) {
+        SEL selector = NSSelectorFromString(name);
+        if (![managerClass respondsToSelector:selector]) {
+            continue;
+        }
+        manager = ((id (*)(id, SEL))objc_msgSend)((id)managerClass, selector);
+        if (manager != nil) {
+            break;
+        }
+    }
+    if (manager == nil) {
+        if (reason != NULL) {
+            *reason = @"SBLockScreenManager has no shared instance";
+        }
+        return NO;
+    }
+    for (NSString *name in @[@"isLockScreenVisible", @"isUILocked"]) {
+        SEL selector = NSSelectorFromString(name);
+        if ([manager respondsToSelector:selector]) {
+            BOOL locked = ((BOOL (*)(id, SEL))objc_msgSend)(manager, selector);
+            if (reason != NULL) {
+                *reason = [NSString stringWithFormat:@"%@=%d", name, locked];
+            }
+            return locked;
+        }
+    }
+    if (reason != NULL) {
+        *reason = @"SBLockScreenManager answers no lock state";
+    }
+    return NO;
+}
+
 @interface EdgeURLGestureController () <EdgeURLPanRecognizerDelegate>
 
 @property (nonatomic, strong) EdgeURLIndicatorView *indicatorView;
+/// The band redrawn over an app: one window per edge, each only as big as the
+/// band itself, and out of hit testing.
+@property (nonatomic, strong) EdgeURLBandWindow *leftBandWindow;
+@property (nonatomic, strong) EdgeURLBandWindow *rightBandWindow;
 /// SpringBoard's home screen window: what this tweak draws into, and the window
 /// the display keeps below every app.
 @property (nonatomic, strong) UIView *desktopView;
@@ -112,6 +177,7 @@ static NSString *EdgeURLGestureName(EdgeURLEdge edge) {
 
 @property (nonatomic, copy) NSString *bandStateKey;
 @property (nonatomic, copy) NSString *gateStateKey;
+@property (nonatomic, copy) NSString *appBandStateKey;
 
 @property (nonatomic, assign) EdgeURLEdge activeEdge;
 @property (nonatomic, assign) CGPoint touchDown;
@@ -432,6 +498,7 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
     [self attachToDesktopInScene:scene];
     [self syncRecognizersInScene:scene];
     [self updateTriggerAreas];
+    [self updateAppBandsInScene:scene];
     if (!self.loggedWindows) {
         self.loggedWindows = YES;
         [self logDesktopStateInScene:scene];
@@ -476,6 +543,101 @@ static BOOL EdgeURLSceneIsAuxiliary(NSString *className) {
 - (CGRect)frameForDesktopView:(UIView *)desktop {
     return [desktop convertRect:[self displayBounds]
              fromCoordinateSpace:[UIScreen mainScreen].coordinateSpace];
+}
+
+#pragma mark - The band over an app
+
+// An app's window covers the home screen window, and with it the band drawn
+// there, but the band is wanted inside an app too — and there is no reliable way
+// to ask from here whether an app is in front: the home screen window is not
+// always reported hidden under one. So the band is drawn a second time in a
+// window of its own, as wide and as tall as the sensing area and nothing more,
+// above every app's window and below the status bar, and out of hit testing
+// altogether, so it changes no touch anywhere on the screen. On the desktop the
+// two are the same shape at the same place in the same tint, so nothing doubled
+// shows; while a swipe is being drawn the desktop draws the stretched panel
+// instead, and this one steps aside so the panel is not drawn over.
+- (void)updateAppBandsInScene:(UIWindowScene *)scene {
+    EdgeURLSettings *settings = [self currentSettings];
+    NSString *lockReason = nil;
+    BOOL locked = EdgeURLDeviceIsLocked(&lockReason);
+    BOOL wanted = settings.enabled && settings.showArea && settings.areaAlpha > 0.001 &&
+                  !locked && !self.active;
+    NSString *key = [NSString stringWithFormat:@"%d|%d|%d|%d|%@", wanted, locked,
+                     self.active, settings.leftEdge, lockReason];
+    if (![key isEqualToString:self.appBandStateKey]) {
+        self.appBandStateKey = key;
+        EdgeURLDebugLog(@"app band locked=%d(%@) active=%d want=%d left=%d right=%d",
+                        locked, lockReason, self.active, wanted,
+                        settings.leftEdge, settings.rightEdge);
+    }
+    [self syncAppBandLeft:YES inScene:scene settings:settings wanted:wanted && settings.leftEdge];
+    [self syncAppBandLeft:NO inScene:scene settings:settings wanted:wanted && settings.rightEdge];
+}
+
+- (void)syncAppBandLeft:(BOOL)left
+                inScene:(UIWindowScene *)scene
+               settings:(EdgeURLSettings *)settings
+                 wanted:(BOOL)wanted {
+    EdgeURLBandWindow *window = left ? self.leftBandWindow : self.rightBandWindow;
+    if (window.windowScene != nil && window.windowScene != scene) {
+        window.hidden = YES;
+        if (left) {
+            self.leftBandWindow = nil;
+        } else {
+            self.rightBandWindow = nil;
+        }
+        window = nil;
+    }
+    if (!wanted) {
+        window.hidden = YES;
+        return;
+    }
+    CGRect rect = [self sensingRectForSettings:settings left:left];
+    if (CGRectGetWidth(rect) < 1.0 || CGRectGetHeight(rect) < 1.0) {
+        window.hidden = YES;
+        return;
+    }
+    if (window == nil) {
+        window = [self makeAppBandWindowInScene:scene left:left];
+    }
+    if (!CGRectEqualToRect(window.frame, rect)) {
+        window.frame = rect;
+    }
+    EdgeURLBandView *view = (EdgeURLBandView *)window.subviews.firstObject;
+    if ([view isKindOfClass:[EdgeURLBandView class]]) {
+        view.leftEdge = left;
+        view.areaAlpha = settings.areaAlpha;
+        if (!CGRectEqualToRect(view.frame, window.bounds)) {
+            view.frame = window.bounds;
+            [view setNeedsDisplay];
+        }
+    }
+    window.hidden = NO;
+}
+
+- (EdgeURLBandWindow *)makeAppBandWindowInScene:(UIWindowScene *)scene left:(BOOL)left {
+    EdgeURLBandWindow *window = [[EdgeURLBandWindow alloc] initWithWindowScene:scene];
+    window.windowLevel = EdgeURLBandWindowLevel;
+    window.backgroundColor = [UIColor clearColor];
+    window.opaque = NO;
+    // The whole window, not only the band inside it: a touch landing on the band
+    // has to reach the app under it, as if the band were not there at all. A
+    // window that answers no hit test is skipped by the display's own search.
+    window.userInteractionEnabled = NO;
+    window.hidden = YES;
+    EdgeURLBandView *view = [[EdgeURLBandView alloc] initWithFrame:window.bounds];
+    view.userInteractionEnabled = NO;
+    view.leftEdge = left;
+    [window addSubview:view];
+    if (left) {
+        self.leftBandWindow = window;
+    } else {
+        self.rightBandWindow = window;
+    }
+    EdgeURLDebugLog(@"app band window %@ level=%.1f",
+                    left ? @"left" : @"right", window.windowLevel);
+    return window;
 }
 
 // One watcher per window the desktop can put a touch into. They are attached to

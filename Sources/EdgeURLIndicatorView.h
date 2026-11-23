@@ -21,6 +21,15 @@ FOUNDATION_EXPORT CGRect EdgeURLSensingRect(CGRect display,
                                             CGFloat regionTopPercent,
                                             CGFloat regionHeightPercent);
 
+/// The shape everything here is drawn with: a rounded rectangle whose two
+/// corners on the edge side are nearly square and whose two on the far side are
+/// round, as Android's back panel is. Shared so the band drawn over an app is
+/// the very same shape as the one drawn on the desktop.
+FOUNDATION_EXPORT UIBezierPath *EdgeURLPanelPath(CGRect rect,
+                                                CGFloat nearRadius,
+                                                CGFloat farRadius,
+                                                BOOL left);
+
 @interface EdgeURLIndicatorView : UIView
 
 @property (nonatomic, assign) EdgeURLEdge edge;

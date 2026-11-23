@@ -164,8 +164,8 @@
   "package": {
     "id": "local.apelin.edgeurl",
     "name": "EdgeURL",
-    "version": "0.6.1",
-    "description": "A translucent sensing bar sits on a desktop edge: only a swipe that starts inside it makes an Android-style wave follow your finger, then the URL opens. The rest of the screen is left alone.",
+    "version": "0.6.5",
+    "description": "A translucent sensing bar sits on an edge over the desktop and every app: a swipe that starts inside it makes an Android-style wave follow your finger, then the URL opens. The rest is left alone.",
     "icon": "https://owngoal-dev.github.io/Apelin/icons/wiki.qaq.apelin.dev.tweak.png",
     "author": "moveon",
     "section": "Tweaks",
